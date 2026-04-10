@@ -2,10 +2,29 @@
 
 import { homedir } from 'node:os';
 
-const WIN_HOME = 'C:/Users/Admin';
-const WIN_HOME_BACKSLASH = 'C:\\Users\\Admin';
-const LINUX_HOME = '/root';
-const DARWIN_HOME = homedir();  // e.g. /Users/admin on macOS
+// Upstream defaults preserve container-style assumptions:
+//   Windows -> C:/Users/Admin (upstream author's username)
+//   Linux   -> /root (upstream runs as root inside containers)
+//   Darwin  -> homedir() (per-user on macOS)
+//
+// OMNIWIRE_{WIN,LINUX,DARWIN}_HOME env vars override these, so non-root
+// Linux hosts and Windows hosts with different usernames can deploy
+// without forking. When the LINUX override is unset, we detect root vs
+// non-root so upstream's root-container behavior is unchanged.
+const WIN_HOME = (process.env.OMNIWIRE_WIN_HOME ?? 'C:/Users/Admin').replaceAll('\\', '/');
+const WIN_HOME_BACKSLASH = WIN_HOME.replaceAll('/', '\\');
+const LINUX_HOME = process.env.OMNIWIRE_LINUX_HOME
+  ?? (process.getuid?.() === 0 ? '/root' : homedir());
+const DARWIN_HOME = process.env.OMNIWIRE_DARWIN_HOME ?? homedir();
+
+/** Returns the canonical home directory for the given OS target */
+export function getHomeForOs(os: 'windows' | 'linux' | 'darwin'): string {
+  switch (os) {
+    case 'windows': return WIN_HOME;
+    case 'linux': return LINUX_HOME;
+    case 'darwin': return DARWIN_HOME;
+  }
+}
 
 const PATH_MAPS: ReadonlyArray<readonly [string, string]> = [
   [WIN_HOME_BACKSLASH, LINUX_HOME],
