@@ -50,12 +50,19 @@ export class OpenClawBridge {
     const files = await walkFiles(dirPath);
     let ingested = 0;
 
+    // Per-node categories (e.g. cron) must namespace the knowledge key so
+    // each node gets its own row in the shared knowledge table; otherwise
+    // nodes overwrite each other on the (source_tool, key) unique index.
+    const isPerNode = category === 'cron';
+
     for (const filePath of files) {
       try {
         const parsed = await parseFile(filePath);
         const relPath = filePath.slice(dirPath.length + 1).replaceAll('\\', '/');
         const keyName = deriveKeyName(relPath, parsed.name);
-        const key = `openclaw:${category}:${keyName}`;
+        const key = isPerNode
+          ? `openclaw:${category}:${this.nodeId}:${keyName}`
+          : `openclaw:${category}:${keyName}`;
 
         await this.db.upsertKnowledge(SOURCE_TOOL, key, {
           source: 'filesystem',

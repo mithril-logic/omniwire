@@ -34,6 +34,62 @@ export class SyncDB {
     await runMigrations(this.pool);
   }
 
+  // One-shot data migration: claim this node's legacy unnamespaced
+  // per-node rows (e.g. `cron/runs/foo.jsonl` updated_by_node=<me>) into
+  // the namespaced form (`cron/<me>/runs/foo.jsonl`). Idempotent — rows
+  // already starting with `cron/<nodeId>/` are skipped. Run once at
+  // daemon startup after schema migrations.
+  //
+  // Safety:
+  // - Only rewrites rows where updated_by_node matches nodeId (we don't
+  //   touch other nodes' legacy writes; they'll claim theirs on their
+  //   own startup).
+  // - Uses UPSERT semantics against the unique index: if a namespaced
+  //   target already exists with a fresher hash, the legacy row is
+  //   marked deleted instead of rewritten.
+  async migrateCronToNamespacedPaths(nodeId: string): Promise<{ migrated: number; skipped: number }> {
+    const prefix = 'cron/';
+    const mePrefix = `cron/${nodeId}/`;
+    // Find candidates: rel_path starts with cron/ but NOT with cron/<me>/,
+    // and we were the last writer.
+    const { rows } = await this.pool.query<{ id: string; tool: string; rel_path: string; content_hash: string }>(
+      `SELECT id, tool, rel_path, content_hash
+       FROM sync_items
+       WHERE rel_path LIKE $1
+         AND rel_path NOT LIKE $2
+         AND updated_by_node = $3
+         AND is_deleted = false`,
+      [`${prefix}%`, `${mePrefix}%`, nodeId]
+    );
+
+    let migrated = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const rest = row.rel_path.slice(prefix.length);
+      const newRelPath = `${mePrefix}${rest}`;
+      // If a target row already exists for (tool, newRelPath), drop the
+      // legacy row rather than collide on the unique index.
+      const existing = await this.pool.query(
+        'SELECT 1 FROM sync_items WHERE tool = $1 AND rel_path = $2',
+        [row.tool, newRelPath]
+      );
+      if (existing.rows.length > 0) {
+        await this.pool.query(
+          'UPDATE sync_items SET is_deleted = true, updated_at = now() WHERE id = $1',
+          [row.id]
+        );
+        skipped++;
+      } else {
+        await this.pool.query(
+          'UPDATE sync_items SET rel_path = $1, updated_at = now() WHERE id = $2',
+          [newRelPath, row.id]
+        );
+        migrated++;
+      }
+    }
+    return { migrated, skipped };
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }

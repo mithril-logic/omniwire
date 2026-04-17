@@ -129,3 +129,71 @@ export function isJsonFile(filePath: string): boolean {
 export function normalizeRelPath(relPath: string): string {
   return relPath.replaceAll('\\', '/');
 }
+
+// --- Per-node path namespacing for inherently-local data ---
+//
+// Background: some subdirectories within a synced tool's base dir hold data
+// that is LOCAL to the node that produced it (e.g. cron run logs, job state
+// files). Without namespacing, every node writes to the same rel_path
+// (`cron/runs/20260416.jsonl`), collides on the `UNIQUE(tool, rel_path)`
+// constraint in sync_items, and produces an infinite conflict loop as each
+// reconcile flags the other node as the owner.
+//
+// Fix: prefix the path with the producing node's id so each node has its
+// own lane in the table. Listing tools can glob `cron/*/runs/*.jsonl` to
+// see everyone's output; pulls deliver only the calling node's slice back
+// to disk (see pullPending in engine.ts).
+//
+// Only applied to paths known to be per-node. Everything else (skills,
+// agents, memory, etc.) remains shared.
+const PER_NODE_PREFIXES: readonly string[] = ['cron/'];
+
+export function isPerNodePath(relPath: string): boolean {
+  const normalized = normalizeRelPath(relPath);
+  return PER_NODE_PREFIXES.some((p) => normalized.startsWith(p));
+}
+
+// If relPath is a per-node path and not yet namespaced, rewrite to
+// `<prefix><nodeId>/<rest>`. Otherwise return unchanged. Idempotent.
+export function namespacePerNodePath(relPath: string, nodeId: string): string {
+  const normalized = normalizeRelPath(relPath);
+  for (const prefix of PER_NODE_PREFIXES) {
+    if (!normalized.startsWith(prefix)) continue;
+    const rest = normalized.slice(prefix.length);
+    // Already namespaced? First segment matches nodeId (or any plausible
+    // node id — we don't have a roster here, so just check that the
+    // first segment looks like it could be one by seeing if rewriting
+    // again would collapse). Be conservative: if the first segment is
+    // exactly `nodeId`, treat as already-namespaced.
+    const firstSlash = rest.indexOf('/');
+    const firstSeg = firstSlash === -1 ? rest : rest.slice(0, firstSlash);
+    if (firstSeg === nodeId) return normalized;
+    return `${prefix}${nodeId}/${rest}`;
+  }
+  return normalized;
+}
+
+// Inverse: if relPath looks like `<prefix><someNode>/<rest>` and someNode
+// matches `nodeId`, strip it back to `<prefix><rest>` for local filesystem
+// delivery. Returns null if the path belongs to a different node (caller
+// should skip that pull).
+export function denamespacePerNodePath(relPath: string, nodeId: string): string | null {
+  const normalized = normalizeRelPath(relPath);
+  for (const prefix of PER_NODE_PREFIXES) {
+    if (!normalized.startsWith(prefix)) continue;
+    const rest = normalized.slice(prefix.length);
+    const firstSlash = rest.indexOf('/');
+    if (firstSlash === -1) {
+      // Bare `cron/foo` with no node segment — legacy unnamespaced file.
+      // Treat as ours (backward compat for pre-fix data) so we don't lose it.
+      return normalized;
+    }
+    const firstSeg = rest.slice(0, firstSlash);
+    if (firstSeg === nodeId) {
+      return `${prefix}${rest.slice(firstSlash + 1)}`;
+    }
+    // Belongs to another node — caller should not land this on disk.
+    return null;
+  }
+  return normalized;
+}

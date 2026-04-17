@@ -44,6 +44,17 @@ async function main(): Promise<void> {
   await db.init();
   process.stderr.write(`PostgreSQL connected (${config.pgHost}:${config.pgPort}/${config.pgDatabase})\n`);
 
+  // One-shot data migration: claim this node's legacy unnamespaced cron/**
+  // rows into `cron/<nodeId>/**`. Idempotent — no-op after first run.
+  try {
+    const m = await db.migrateCronToNamespacedPaths(nodeId);
+    if (m.migrated > 0 || m.skipped > 0) {
+      process.stderr.write(`[sync] cron namespace migration: migrated=${m.migrated}, skipped=${m.skipped}\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`[sync] cron namespace migration failed (non-fatal): ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+
   // Connect mesh nodes
   const manager = new NodeManager();
   await manager.connectAll();

@@ -14,7 +14,7 @@ import type { TransferEngine } from '../nodes/transfer.js';
 import { hashBuffer, hashFile } from './hasher.js';
 import { VaultBridge } from './vault-bridge.js';
 import { categorizeFile } from './manifest.js';
-import { adaptPathsForNode, getToolBaseDir, isJsonFile, normalizeRelPath } from './paths.js';
+import { adaptPathsForNode, denamespacePerNodePath, getToolBaseDir, isJsonFile, isPerNodePath, namespacePerNodePath, normalizeRelPath } from './paths.js';
 import { allNodes } from '../protocol/config.js';
 import { encrypt, decrypt, isSensitivePath, loadOrCreateKey, hasEncryptionKey } from './crypto.js';
 
@@ -38,14 +38,19 @@ export class SyncEngine {
     const data = await readFile(absPath);
     const hash = hashBuffer(data);
 
+    // Namespace per-node paths (e.g. cron/**) so each node has its own
+    // lane in sync_items and doesn't clobber peers on the (tool, rel_path)
+    // unique index. No-op for shared paths.
+    const storedRelPath = namespacePerNodePath(relPath, this.config.nodeId);
+
     // Encrypt sensitive files before storing in DB
-    const sensitive = isSensitivePath(relPath) && hasEncryptionKey();
+    const sensitive = isSensitivePath(storedRelPath) && hasEncryptionKey();
     const content = sensitive ? encrypt(data, loadOrCreateKey()) : data;
 
     const item = await this.db.upsertItem({
       tool,
-      category: categorizeFile(relPath),
-      relPath,
+      category: categorizeFile(storedRelPath),
+      relPath: storedRelPath,
       contentHash: hash,
       content,
       contentSize: data.length,
@@ -70,9 +75,10 @@ export class SyncEngine {
 
   // Delete a file from the database
   async deleteFile(tool: string, relPath: string): Promise<void> {
-    await this.db.markDeleted(tool, relPath, this.config.nodeId);
-    await this.db.logEvent(null, this.config.nodeId, 'delete', `Deleted ${tool}:${relPath}`);
-    try { await this.vault.deleteSyncItem(tool, relPath); } catch {}
+    const storedRelPath = namespacePerNodePath(relPath, this.config.nodeId);
+    await this.db.markDeleted(tool, storedRelPath, this.config.nodeId);
+    await this.db.logEvent(null, this.config.nodeId, 'delete', `Deleted ${tool}:${storedRelPath}`);
+    try { await this.vault.deleteSyncItem(tool, storedRelPath); } catch {}
   }
 
   // Pull pending items from DB to local filesystem (decrypts encrypted items)
@@ -86,10 +92,25 @@ export class SyncEngine {
       // Skip .git internals and other non-syncable paths
       if (shouldSkipPath(item.relPath)) continue;
 
+      // Per-node paths (cron/**) from OTHER nodes never land on our disk.
+      // Our own items get stripped back to the canonical local path so the
+      // cron subsystem reads its expected location.
+      let diskRelPath = item.relPath;
+      if (isPerNodePath(item.relPath)) {
+        const denamespaced = denamespacePerNodePath(item.relPath, this.config.nodeId);
+        if (denamespaced === null) {
+          // Another node's local-only data — mark as synced-to-this-node so
+          // we don't keep selecting it forever, but don't write to disk.
+          await this.db.upsertNodeSync(this.config.nodeId, item.id, item.contentHash);
+          continue;
+        }
+        diskRelPath = denamespaced;
+      }
+
       const localNode = allNodes().find((n) => n.id === this.config.nodeId);
       const os = localNode?.os ?? 'linux';
       const baseDir = getToolBaseDir(item.tool, os);
-      const absPath = join(baseDir, item.relPath);
+      const absPath = join(baseDir, diskRelPath);
 
       // Decrypt if item was stored encrypted
       let content: Buffer;
@@ -178,7 +199,10 @@ export class SyncEngine {
         for (const result of results) {
           if (result.status === 'rejected') continue;
           const { absPath, relPath, localHash } = result.value;
-          const existing = itemMap.get(relPath);
+          // Look up by the stored (possibly per-node-namespaced) rel_path so
+          // cron/**-style items collide only with THIS node's own rows.
+          const lookupRelPath = namespacePerNodePath(relPath, this.config.nodeId);
+          const existing = itemMap.get(lookupRelPath);
 
           if (!existing) {
             await this.pushFile(manifest.tool, relPath, absPath, { skipRemotePush: true });
@@ -194,7 +218,7 @@ export class SyncEngine {
             } else {
               conflicts++;
               await this.db.logEvent(existing.id, this.config.nodeId, 'conflict',
-                `Diverged: ${relPath} (local=${localHash.slice(0, 8)}, remote=${existing.contentHash.slice(0, 8)}, owner=${existing.updatedByNode})`);
+                `Diverged: ${lookupRelPath} (local=${localHash.slice(0, 8)}, remote=${existing.contentHash.slice(0, 8)}, owner=${existing.updatedByNode})`);
             }
           }
         }
@@ -225,10 +249,19 @@ export class SyncEngine {
     const dbItems = await this.db.getAllItems();
 
     for (const item of dbItems) {
+      // Per-node items belonging to another node are not part of this
+      // node's diff — they're never meant to be pulled to our disk.
+      let diskRelPath = item.relPath;
+      if (isPerNodePath(item.relPath)) {
+        const denamespaced = denamespacePerNodePath(item.relPath, this.config.nodeId);
+        if (denamespaced === null) continue;
+        diskRelPath = denamespaced;
+      }
+
       const localNode = allNodes().find((n) => n.id === this.config.nodeId);
       const os = localNode?.os ?? 'linux';
       const baseDir = getToolBaseDir(item.tool, os);
-      const absPath = join(baseDir, item.relPath);
+      const absPath = join(baseDir, diskRelPath);
 
       let localHash: string | null = null;
       try {
