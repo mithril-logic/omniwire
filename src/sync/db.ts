@@ -2,12 +2,21 @@
 
 import pg from 'pg';
 import { runMigrations } from './schema.js';
+import { parseEnvMs } from './types.js';
 import type { SyncItem, NodeSyncState, SyncEvent, SyncEventType, KnowledgeEntry, ClaudeMemoryEntry, NodeHeartbeat, SyncConfig } from './types.js';
 
 export class SyncDB {
   private pool: pg.Pool;
 
   constructor(private config: SyncConfig) {
+    // Resolve statement_timeout via validated helper. Guards against non-numeric
+    // input (e.g. "30s") which Number() coerces to NaN; node-postgres treats NaN
+    // as falsy and would silently omit the timeout — worse than the 10s default.
+    const statementTimeoutMs = parseEnvMs(
+      'CYBERSYNC_STATEMENT_TIMEOUT_MS',
+      process.env.CYBERSYNC_STATEMENT_TIMEOUT_MS,
+      10_000,
+    );
     this.pool = new pg.Pool({
       host: config.pgHost,
       port: config.pgPort,
@@ -17,7 +26,7 @@ export class SyncDB {
       max: 8,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
-      statement_timeout: process.env.CYBERSYNC_STATEMENT_TIMEOUT_MS ? Number(process.env.CYBERSYNC_STATEMENT_TIMEOUT_MS) : 10_000,
+      statement_timeout: statementTimeoutMs,
     });
   }
 

@@ -765,6 +765,7 @@ omniwire_mesh_status()   # 88 tools should be available
 | `OP_SERVICE_ACCOUNT_TOKEN` | For 1Password sync | Service account token from 1Password |
 | `OMNIWIRE_VAULT_ROOT` | Optional | Path to Obsidian vault root (default: CyberBase vault) |
 | `CYBERSYNC_DB_URL` | Optional | PostgreSQL DSN — defaults to `postgresql://cyberbase@10.0.0.1:5432/cyberbase` |
+| `CYBERSYNC_STATEMENT_TIMEOUT_MS` | Optional | Postgres `statement_timeout` for the CyberSync pool, in ms. Default `10000`. `0` disables the timeout (Postgres semantics). Non-numeric or negative values are rejected with a stderr warning and the default is used. |
 | `OMNIWIRE_MESH_CONFIG` | Optional | Override mesh.json path |
 
 Set persistently on a node:

@@ -117,6 +117,21 @@ function parseDbUrl(): Partial<Pick<SyncConfig, 'pgHost' | 'pgPort' | 'pgDatabas
   }
 }
 
+// Parse a millisecond-valued env var. Rejects non-numeric and negative values,
+// falling back to `defaultMs` with a stderr warning. Guards against the
+// `Number('30s') === NaN` case, which node-postgres treats as falsy and would
+// silently ship a pool with NO statement_timeout at all.
+// Accepts 0 — Postgres interprets statement_timeout=0 as "no limit".
+export function parseEnvMs(envName: string, raw: string | undefined, defaultMs: number): number {
+  if (raw === undefined || raw === '') return defaultMs;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    process.stderr.write(`Warning: invalid ${envName}='${raw}', using default ${defaultMs}ms\n`);
+    return defaultMs;
+  }
+  return n;
+}
+
 const _dbUrl = parseDbUrl();
 const _dbCreds = getDbCredentials();
 
