@@ -2,33 +2,69 @@
 
 import { homedir } from 'node:os';
 
-// Upstream defaults preserve container-style assumptions:
-//   Windows -> C:/Users/Admin (upstream author's username)
-//   Linux   -> /root (upstream runs as root inside containers)
-//   Darwin  -> homedir() (per-user on macOS)
+// Two distinct roles for "home" in this module:
 //
-// OMNIWIRE_{WIN,LINUX,DARWIN}_HOME env vars override these, so non-root
-// Linux hosts and Windows hosts with different usernames can deploy
-// without forking. When the LINUX override is unset, we detect root vs
-// non-root so upstream's root-container behavior is unchanged.
-const WIN_HOME = (process.env.OMNIWIRE_WIN_HOME ?? 'C:/Users/Admin').replaceAll('\\', '/');
-const WIN_HOME_BACKSLASH = WIN_HOME.replaceAll('/', '\\');
-const LINUX_HOME = process.env.OMNIWIRE_LINUX_HOME
-  ?? (process.getuid?.() === 0 ? '/root' : homedir());
-const DARWIN_HOME = process.env.OMNIWIRE_DARWIN_HOME ?? homedir();
+//   1. CANONICAL — the literal string that appears in synced JSON content
+//      and is used by PATH_MAPS for cross-node string rewriting. This MUST
+//      be stable across every node in the mesh or content will silently
+//      corrupt (e.g. node A writes "/home/alice/...", node B can't match
+//      it because B's canonical is "/home/bob/..."). These values match
+//      upstream's container-style assumptions: Windows runs as "Admin",
+//      Linux runs as root inside a container.
+//
+//   2. LOCAL — where this particular host looks on disk when discovering
+//      manifests or resolving tool base directories. This can (and should)
+//      vary per host, so non-root Linux users and Windows boxes with other
+//      usernames don't need to fork.
+//
+// Only LOCAL is influenced by env vars / uid / homedir(). CANONICAL is
+// frozen so cross-node rewriting keeps working.
 
-/** Returns the canonical home directory for the given OS target */
+const CANONICAL_WIN_HOME = 'C:/Users/Admin';
+const CANONICAL_WIN_HOME_BACKSLASH = 'C:\\Users\\Admin';
+const CANONICAL_LINUX_HOME = '/root';
+
+/** Treat undefined, null, and whitespace-only env values as "unset". */
+function envOverride(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+const winOverride = envOverride('OMNIWIRE_WIN_HOME');
+const LOCAL_WIN_HOME = (winOverride
+  ?? (process.platform === 'win32' ? homedir() : CANONICAL_WIN_HOME)
+).replaceAll('\\', '/');
+
+const linuxOverride = envOverride('OMNIWIRE_LINUX_HOME');
+const LOCAL_LINUX_HOME = linuxOverride
+  ?? (process.platform === 'linux'
+      ? (process.getuid?.() === 0 ? CANONICAL_LINUX_HOME : homedir())
+      : CANONICAL_LINUX_HOME);
+
+const darwinOverride = envOverride('OMNIWIRE_DARWIN_HOME');
+const LOCAL_DARWIN_HOME = darwinOverride ?? homedir();
+
+/**
+ * Returns the LOCAL home directory for the given OS target — i.e. where
+ * this host looks on disk. Used by manifest discovery and getToolBaseDir.
+ * NOT safe to use for cross-node content rewriting; PATH_MAPS below uses
+ * the frozen CANONICAL_* values for that.
+ */
 export function getHomeForOs(os: 'windows' | 'linux' | 'darwin'): string {
   switch (os) {
-    case 'windows': return WIN_HOME;
-    case 'linux': return LINUX_HOME;
-    case 'darwin': return DARWIN_HOME;
+    case 'windows': return LOCAL_WIN_HOME;
+    case 'linux': return LOCAL_LINUX_HOME;
+    case 'darwin': return LOCAL_DARWIN_HOME;
   }
 }
 
+// Cross-node rewriting table — always uses the canonical literals so every
+// node produces the same output regardless of its own local home.
 const PATH_MAPS: ReadonlyArray<readonly [string, string]> = [
-  [WIN_HOME_BACKSLASH, LINUX_HOME],
-  [WIN_HOME, LINUX_HOME],
+  [CANONICAL_WIN_HOME_BACKSLASH, CANONICAL_LINUX_HOME],
+  [CANONICAL_WIN_HOME, CANONICAL_LINUX_HOME],
 ];
 
 export function toLinuxPath(content: string): string {
@@ -49,11 +85,11 @@ export function toWindowsPath(content: string): string {
 
 export function toDarwinPath(content: string): string {
   let result = content;
-  // Replace Windows paths with Darwin home
-  result = result.replaceAll(WIN_HOME_BACKSLASH, DARWIN_HOME);
-  result = result.replaceAll(WIN_HOME, DARWIN_HOME);
-  // Replace Linux home with Darwin home
-  result = result.replaceAll(LINUX_HOME, DARWIN_HOME);
+  // Replace canonical Windows paths with local Darwin home
+  result = result.replaceAll(CANONICAL_WIN_HOME_BACKSLASH, LOCAL_DARWIN_HOME);
+  result = result.replaceAll(CANONICAL_WIN_HOME, LOCAL_DARWIN_HOME);
+  // Replace canonical Linux home with local Darwin home
+  result = result.replaceAll(CANONICAL_LINUX_HOME, LOCAL_DARWIN_HOME);
   // Normalize backslashes to forward slashes
   return result.replaceAll('\\\\', '/').replaceAll('\\', '/');
 }
@@ -65,7 +101,7 @@ export function adaptPathsForNode(content: string, targetOs: 'windows' | 'linux'
 }
 
 export function getToolBaseDir(tool: string, os: 'windows' | 'linux' | 'darwin'): string {
-  const home = os === 'windows' ? WIN_HOME : os === 'darwin' ? DARWIN_HOME : LINUX_HOME;
+  const home = getHomeForOs(os);
 
   switch (tool) {
     case 'claude-code':

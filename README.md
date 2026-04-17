@@ -767,6 +767,9 @@ omniwire_mesh_status()   # 88 tools should be available
 | `CYBERSYNC_DB_URL` | Optional | PostgreSQL DSN — defaults to `postgresql://cyberbase@10.0.0.1:5432/cyberbase` |
 | `CYBERSYNC_STATEMENT_TIMEOUT_MS` | Optional | Postgres `statement_timeout` for the CyberSync pool, in ms. Default `10000`. `0` disables the timeout (Postgres semantics). Non-numeric or negative values are rejected with a stderr warning and the default is used. |
 | `OMNIWIRE_MESH_CONFIG` | Optional | Override mesh.json path |
+| `OMNIWIRE_WIN_HOME` | Optional | Local Windows home dir for CyberSync manifest discovery (default: `os.homedir()` on Windows, `C:/Users/Admin` elsewhere). Absolute path only; empty string is ignored. Affects local disk lookup only — cross-node path rewriting still uses the canonical `C:/Users/Admin` literal, so mixed-username meshes do not drift. |
+| `OMNIWIRE_LINUX_HOME` | Optional | Local Linux home dir for CyberSync manifest discovery (default: `/root` when running as root on Linux, `os.homedir()` for non-root Linux, `/root` elsewhere). Absolute path only; empty string is ignored. Affects local disk lookup only — cross-node path rewriting still uses the canonical `/root` literal. |
+| `OMNIWIRE_DARWIN_HOME` | Optional | Local macOS home dir for CyberSync manifest discovery (default: `os.homedir()`). Absolute path only; empty string is ignored. |
 
 Set persistently on a node:
 ```bash
