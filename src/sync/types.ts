@@ -98,15 +98,27 @@ export interface SyncConfig {
   readonly reconcileIntervalMs: number;
 }
 
-// Parse CYBERSYNC_DB_URL (postgresql://user:pass@host:port/db) if set
+// Parse CYBERSYNC_DB_URL (postgresql://user:pass@host:port/db) if set.
+// Port is parsed with Number.isFinite + 1-65535 bounds guard — bare parseInt
+// returns NaN on malformed input, which pg interprets variably (silent default
+// or crash).
 function parseDbUrl(): Partial<Pick<SyncConfig, 'pgHost' | 'pgPort' | 'pgDatabase' | 'pgUser' | 'pgPassword'>> {
   const url = process.env.CYBERSYNC_DB_URL;
   if (!url) return {};
   try {
     const u = new URL(url);
+    let port: number | undefined;
+    if (u.port) {
+      const n = parseInt(u.port, 10);
+      if (Number.isFinite(n) && n > 0 && n <= 65535) {
+        port = n;
+      } else {
+        process.stderr.write(`Warning: invalid port '${u.port}' in CYBERSYNC_DB_URL, ignoring\n`);
+      }
+    }
     return {
       pgHost: u.hostname || undefined,
-      pgPort: u.port ? parseInt(u.port, 10) : undefined,
+      pgPort: port,
       pgDatabase: u.pathname.slice(1) || undefined,
       pgUser: decodeURIComponent(u.username) || undefined,
       pgPassword: decodeURIComponent(u.password) || undefined,
@@ -135,12 +147,26 @@ export function parseEnvMs(envName: string, raw: string | undefined, defaultMs: 
 const _dbUrl = parseDbUrl();
 const _dbCreds = getDbCredentials();
 
+function resolvePgPassword(): string {
+  if (_dbUrl.pgPassword !== undefined) return _dbUrl.pgPassword;
+  const envPw = process.env.OW_PG_PASSWORD;
+  if (envPw !== undefined) return envPw;
+  // Falling back to the legacy literal — loud on stderr so it surfaces in
+  // logs if it ever fires in production. Set OW_PG_PASSWORD (or embed a
+  // password in CYBERSYNC_DB_URL) to silence this.
+  process.stderr.write(
+    `[cybersync] warning: no CYBERSYNC_DB_URL password and no OW_PG_PASSWORD — ` +
+    `using legacy default password.\n`
+  );
+  return 'cyberbase';
+}
+
 export const DEFAULT_SYNC_CONFIG: Omit<SyncConfig, 'nodeId'> = {
   pgHost: _dbUrl.pgHost ?? _dbCreds.host,
   pgPort: _dbUrl.pgPort ?? _dbCreds.port,
   pgDatabase: _dbUrl.pgDatabase ?? _dbCreds.database,
   pgUser: _dbUrl.pgUser ?? _dbCreds.user,
-  pgPassword: _dbUrl.pgPassword ?? process.env.OW_PG_PASSWORD ?? 'cyberbase',
+  pgPassword: resolvePgPassword(),
   watchDebounceMs: 300,
   reconcileIntervalMs: 2 * 60 * 1000,  // 2min (was 5min)  faster convergence
 };

@@ -15,7 +15,7 @@ import { ShellManager, kernelExec } from '../nodes/shell.js';
 import { RealtimeChannel } from '../nodes/realtime.js';
 import { TunnelManager } from '../nodes/tunnel.js';
 import { openBrowser } from '../commands/browser.js';
-import { allNodes, remoteNodes, findNode, NODE_ROLES, getDefaultNodeForTask, CONFIG, getLocalNodeId, getDbNode, getDockerNode, getBrowserNode } from '../protocol/config.js';
+import { allNodes, remoteNodes, findNode, NODE_ROLES, getDefaultNodeForTask, CONFIG, getLocalNodeId, getDbNode, getDockerNode, getBrowserNode, pgExecPrefix, getDbCredentials } from '../protocol/config.js';
 import { parseMeshPath } from '../protocol/paths.js';
 import {
   genKeysCmd, parseKeys, buildWgConfig, wgConfigPath, bringUpCmd, bringDownCmd,
@@ -222,8 +222,9 @@ let cbDraining = false;
 
 function cbInit(mgr: NodeManager) { cbManager = mgr; }
 
-/** psql helper — all DB calls have 5s statement_timeout to prevent hangs */
-const pgExec = (sql: string) => `psql -h 127.0.0.1 -U cyberbase -d cyberbase -c "SET statement_timeout='5s'; ${sql}" 2>/dev/null`;
+/** psql helper — all DB calls have 5s statement_timeout to prevent hangs.
+ *  Uses pgExecPrefix() so CYBERSYNC_DB_URL / OMNIWIRE_PG_* env vars take effect. */
+const pgExec = (sql: string) => `${pgExecPrefix()} -c "SET statement_timeout='5s'; ${sql}" 2>/dev/null`;
 
 // CyberBase health tracking
 let cbHealthy = true;
@@ -519,7 +520,7 @@ async function cbGet(category: string, key: string): Promise<string | null> {
   if (!cbManager) return null;
   const fullKey = `${category}:${key}`.replace(/'/g, "''");
   try {
-    const r = await cbManager.exec(getDbNode(), `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';SELECT value->>'data' FROM knowledge WHERE source_tool='omniwire' AND key='${fullKey}';" 2>/dev/null`);
+    const r = await cbManager.exec(getDbNode(), `${pgExecPrefix()} -t -c "SET statement_timeout='5s';SELECT value->>'data' FROM knowledge WHERE source_tool='omniwire' AND key='${fullKey}';" 2>/dev/null`);
     const val = r.stdout.trim();
     return val || null;
   } catch { return null; }
@@ -530,7 +531,7 @@ async function cbList(category: string): Promise<string[]> {
   if (!cbManager) return [];
   const prefix = `${category}:`.replace(/'/g, "''");
   try {
-    const r = await cbManager.exec(getDbNode(), `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';SELECT replace(key, '${prefix}', '') FROM knowledge WHERE source_tool='omniwire' AND key LIKE '${prefix}%' ORDER BY updated_at DESC LIMIT 100;" 2>/dev/null`);
+    const r = await cbManager.exec(getDbNode(), `${pgExecPrefix()} -t -c "SET statement_timeout='5s';SELECT replace(key, '${prefix}', '') FROM knowledge WHERE source_tool='omniwire' AND key LIKE '${prefix}%' ORDER BY updated_at DESC LIMIT 100;" 2>/dev/null`);
     return r.stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
   } catch { return []; }
 }
@@ -542,7 +543,7 @@ async function cbSearch(query: string, sourceFilter?: string): Promise<string> {
   const escaped = query.replace(/'/g, "''");
   try {
     const r = await cbManager.exec(getDbNode(),
-      `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';SELECT source_tool, key, substring(value::text,1,200) FROM knowledge WHERE (value::text ILIKE '%${escaped}%' OR key ILIKE '%${escaped}%') ${srcFilter} ORDER BY updated_at DESC LIMIT 20;" 2>/dev/null`
+      `${pgExecPrefix()} -t -c "SET statement_timeout='5s';SELECT source_tool, key, substring(value::text,1,200) FROM knowledge WHERE (value::text ILIKE '%${escaped}%' OR key ILIKE '%${escaped}%') ${srcFilter} ORDER BY updated_at DESC LIMIT 20;" 2>/dev/null`
     );
     return r.stdout.trim();
   } catch { return ''; }
@@ -555,7 +556,7 @@ async function cbSemanticSearch(query: string, limit: number = 10): Promise<stri
   try {
     // Try pgvector cosine similarity first
     const r = await cbManager.exec(getDbNode(),
-      `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';
+      `${pgExecPrefix()} -t -c "SET statement_timeout='5s';
         SELECT source_tool, key, substring(value::text,1,300)
         FROM knowledge
         WHERE embedding IS NOT NULL
@@ -566,7 +567,7 @@ async function cbSemanticSearch(query: string, limit: number = 10): Promise<stri
     if (r.stdout.trim()) return r.stdout.trim();
     // Fallback: ILIKE full-text
     const r2 = await cbManager.exec(getDbNode(),
-      `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';
+      `${pgExecPrefix()} -t -c "SET statement_timeout='5s';
         SELECT source_tool, key, substring(value::text,1,300)
         FROM knowledge
         WHERE value::text ILIKE '%${escaped}%' OR key ILIKE '%${escaped}%'
@@ -2218,7 +2219,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
         const domainKey = domain ?? 'all';
         const pgEscaped = src.stdout.replace(/'/g, "''");
         const cyberbaseResult = await manager.exec(getDbNode(),
-          `psql -h 127.0.0.1 -U cyberbase -d cyberbase -c "SET statement_timeout='5s'; INSERT INTO sync_items (category, key, value, updated_at) VALUES ('cookies', '${domainKey}', '${pgEscaped}', NOW()) ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" 2>/dev/null && echo "cyberbase: synced" || echo "cyberbase: skipped (no DB)"`
+          `${pgExecPrefix()} -c "SET statement_timeout='5s'; INSERT INTO sync_items (category, key, value, updated_at) VALUES ('cookies', '${domainKey}', '${pgEscaped}', NOW()) ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" 2>/dev/null && echo "cyberbase: synced" || echo "cyberbase: skipped (no DB)"`
         );
 
         // 3. Sync to 1Password (if op CLI available)
@@ -2243,7 +2244,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       if (action === 'cyberbase-get') {
         const domainKey = domain ?? 'all';
         const r = await manager.exec(getDbNode(),
-          `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s';SELECT value FROM sync_items WHERE category='cookies' AND key='${domainKey}';" 2>/dev/null`
+          `${pgExecPrefix()} -t -c "SET statement_timeout='5s';SELECT value FROM sync_items WHERE category='cookies' AND key='${domainKey}';" 2>/dev/null`
         );
         if (!r.stdout.trim()) return fail(`No cookies for '${domainKey}' in CyberBase`);
         return ok(getDbNode(), r.durationMs, r.stdout.trim(), `cyberbase cookies: ${domainKey}`);
@@ -2253,7 +2254,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
         const domainKey = domain ?? 'all';
         const pgEsc = cookieData.replace(/'/g, "''");
         const r = await manager.exec(getDbNode(),
-          `psql -h 127.0.0.1 -U cyberbase -d cyberbase -c "SET statement_timeout='5s'; INSERT INTO sync_items (category, key, value, updated_at) VALUES ('cookies', '${domainKey}', '${pgEsc}', NOW()) ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" 2>/dev/null`
+          `${pgExecPrefix()} -c "SET statement_timeout='5s'; INSERT INTO sync_items (category, key, value, updated_at) VALUES ('cookies', '${domainKey}', '${pgEsc}', NOW()) ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" 2>/dev/null`
         );
         return r.code === 0 ? okBrief(`Cookies stored in CyberBase: ${domainKey}`) : fail(r.stderr);
       }
@@ -4082,7 +4083,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
         `ip link show wg0 >/dev/null 2>&1 && echo "PASS wireguard wg0 up" || echo "WARN wireguard wg0 not found"`,
         `for tool in curl tar gzip lz4 nc; do command -v $tool >/dev/null 2>&1 && echo "PASS tool:$tool" || echo "FAIL tool:$tool missing"; done`,
         `omniwire --version >/dev/null 2>&1 && echo "PASS omniwire installed" || echo "WARN omniwire binary not in PATH"`,
-        `timeout 3 bash -c 'echo "" | nc -w2 10.10.0.1 5432' 2>/dev/null && echo "PASS cyberbase reachable" || echo "WARN cyberbase 10.10.0.1:5432 unreachable"`,
+        (() => { const c = getDbCredentials(); return `timeout 3 bash -c 'echo "" | nc -w2 ${c.host} ${c.port}' 2>/dev/null && echo "PASS cyberbase reachable" || echo "WARN cyberbase ${c.host}:${c.port} unreachable"`; })(),
       ].join('; ');
 
       const targetNodes = node ? [node] : manager.getOnlineNodes();
@@ -4544,7 +4545,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       if (action === 'categories') {
         if (!cbManager) return fail('no CyberBase connection');
         const src = source ?? 'omniwire';
-        const r = await cbManager.exec(getDbNode(), `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='5s'; SELECT DISTINCT split_part(key, ':', 1) AS cat, count(*) FROM knowledge WHERE source_tool='${sqlEscape(src)}' GROUP BY cat ORDER BY count DESC LIMIT 50;" 2>/dev/null`);
+        const r = await cbManager.exec(getDbNode(), `${pgExecPrefix()} -t -c "SET statement_timeout='5s'; SELECT DISTINCT split_part(key, ':', 1) AS cat, count(*) FROM knowledge WHERE source_tool='${sqlEscape(src)}' GROUP BY cat ORDER BY count DESC LIMIT 50;" 2>/dev/null`);
         return okBrief(`Categories (${src}):\n${r.stdout.trim()}`);
       }
 
@@ -4600,7 +4601,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
         if (!cbManager) return fail('no CyberBase connection');
         const src = source ?? 'omniwire';
         const catFilter = category ? `AND key LIKE '${sqlEscape(category)}:%'` : '';
-        const r = await cbManager.exec(getDbNode(), `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -c "SET statement_timeout='10s'; SELECT json_agg(json_build_object('key', key, 'value', value->>'data', 'updated', updated_at)) FROM knowledge WHERE source_tool='${sqlEscape(src)}' ${catFilter} LIMIT ${lim};" 2>/dev/null`);
+        const r = await cbManager.exec(getDbNode(), `${pgExecPrefix()} -t -c "SET statement_timeout='10s'; SELECT json_agg(json_build_object('key', key, 'value', value->>'data', 'updated', updated_at)) FROM knowledge WHERE source_tool='${sqlEscape(src)}' ${catFilter} LIMIT ${lim};" 2>/dev/null`);
         return okBrief(r.stdout.trim() || '(no data)');
       }
 
@@ -4702,7 +4703,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
         if (!cbManager) return fail('no CyberBase connection');
         ensureVault();
         // Export all knowledge entries from PostgreSQL and write as .md files
-        const r = await cbManager.exec(getDbNode(), `psql -h 127.0.0.1 -U cyberbase -d cyberbase -t -A -F '|' -c "SET statement_timeout='30s'; SELECT key, value->>'data', updated_at FROM knowledge WHERE source_tool='omniwire' ORDER BY key;" 2>/dev/null`);
+        const r = await cbManager.exec(getDbNode(), `${pgExecPrefix()} -t -A -F '|' -c "SET statement_timeout='30s'; SELECT key, value->>'data', updated_at FROM knowledge WHERE source_tool='omniwire' ORDER BY key;" 2>/dev/null`);
         if (!r.stdout.trim()) return okBrief('mirror-db: no entries found in CyberBase');
         const lines = r.stdout.trim().split('\n').filter((l: string) => l.includes('|'));
         let synced = 0;
