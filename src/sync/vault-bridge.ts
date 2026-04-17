@@ -1,19 +1,10 @@
-// CyberBase Obsidian Vault Bridge — mirrors PostgreSQL data as Obsidian markdown
+// CyberBase Obsidian Vault Bridge â€” mirrors PostgreSQL data as Obsidian markdown
 // Every sync item, knowledge entry, and memory gets a .md file in the vault
 // Obsidian Sync handles cloud backup automatically
 
-import { writeFile, mkdir, unlink, readdir } from 'node:fs/promises';
+import { writeFile, mkdir, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
-import { homedir, platform } from 'node:os';
-
-const VAULT_PATHS: Record<string, string> = {
-  windows: join(homedir(), 'Documents', 'BuisnessProjects', 'CyberBase'),
-  linux: join(homedir(), '.cyberbase', 'vault'),
-};
-
-function getVaultPath(): string {
-  return VAULT_PATHS[platform() === 'win32' ? 'windows' : 'linux'];
-}
+import { getVaultPath } from '../protocol/config.js';
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[<>:"/\|?*]/g, '_').replace(/\s+/g, ' ').trim();

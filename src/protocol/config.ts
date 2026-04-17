@@ -1,9 +1,13 @@
 // OmniWire mesh configuration
 // Resolution order: env var → ~/.omniwire/mesh.json → built-in defaults
-// Built-in defaults match upstream CyberNord infra so nothing breaks without config.
+// Built-in defaults mirror the existing hardcoded topology so zero-config
+// deployments behave the way they used to.
+//
+// Note: mesh.json is read once at module load. Changing the file at runtime
+// does NOT take effect until the process restarts.
 
 import { readFileSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import type { MeshConfig, MeshNode, NodeRole } from './types.js';
 
@@ -12,14 +16,18 @@ const sshDir = join(home, '.ssh');
 const meshJsonPath = process.env.OMNIWIRE_MESH_JSON ?? join(home, '.omniwire', 'mesh.json');
 
 // Fallback host resolution order: WireGuard → Tailscale → Public IP
-// NodeManager tries each in order until one connects
+// NodeManager tries each in order until one connects.
 export interface HostFallback {
   readonly wg: string;
   readonly tailscale?: string;
   readonly publicIp?: string;
 }
 
-// Loaded per-node from mesh.json "hostFallbacks" field
+// Populated at module load from (in order, last-write-wins):
+//   1. Built-in WG defaults + OW_<NODE>_TS / OW_<NODE>_PUB env vars.
+//   2. mesh.json's per-node "hostFallbacks" field (overrides builtin).
+// Consumers (NodeManager via getHostCandidates) should treat this as read-only
+// after module init.
 export const HOST_FALLBACKS: Record<string, HostFallback> = {};
 
 interface MeshJsonNode {
@@ -42,10 +50,26 @@ interface MeshJson {
   meshSubnet?: string;
 }
 
+// Expand ~/ and $HOME / ${HOME} in identityFile paths, then resolve relative
+// names against ~/.ssh/. Keeps absolute paths untouched.
 function resolveIdentityFile(file: string): string {
   if (!file) return '';
-  if (isAbsolute(file)) return file;
-  return join(sshDir, file);
+  let f = file;
+  if (f.startsWith('~/')) return join(home, f.slice(2));
+  if (f === '~') return home;
+  // $HOME / ${HOME} at the start of the path
+  f = f.replace(/^\$\{?HOME\}?(?=\/|$)/, home);
+  if (isAbsolute(f)) return f;
+  return join(sshDir, f);
+}
+
+// Parse a port env var with NaN/bounds guard.
+// parseInt('abc') → NaN; `pg` then defaults or errors depending on driver —
+// undefined behavior. Reject NaN, negatives, and out-of-range values.
+function parsePort(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 && n <= 65535 ? n : fallback;
 }
 
 interface MeshLoadResult {
@@ -60,7 +84,10 @@ function loadMeshJson(): MeshLoadResult | null {
   try {
     const raw = readFileSync(meshJsonPath, 'utf-8');
     const json: MeshJson = JSON.parse(raw);
-    if (!Array.isArray(json.nodes)) return null;
+    if (!Array.isArray(json.nodes)) {
+      process.stderr.write(`[omniwire] warning: ${meshJsonPath} has no "nodes" array, falling back to builtins\n`);
+      return null;
+    }
 
     const nodes: MeshNode[] = json.nodes.map((n) => ({
       id: n.id,
@@ -74,7 +101,7 @@ function loadMeshJson(): MeshLoadResult | null {
       tags: n.tags ?? [],
     }));
 
-    // Populate HOST_FALLBACKS from mesh.json
+    // Overlay mesh.json "hostFallbacks" on top of env-var-populated builtins.
     for (const n of json.nodes) {
       if (n.hostFallbacks) {
         HOST_FALLBACKS[n.id] = n.hostFallbacks;
@@ -87,12 +114,36 @@ function loadMeshJson(): MeshLoadResult | null {
       defaultNode: json.defaultNode ?? 'local',
       meshSubnet: json.meshSubnet ?? '0.0.0.0/0',
     };
-  } catch {
+  } catch (err) {
+    // ENOENT is handled by existsSync above; any remaining error is a real
+    // problem (malformed JSON, permission error, encoding issue). Make it
+    // loud so users don't silently run on the fallback builtins.
+    const msg = (err as Error).message;
+    process.stderr.write(`[omniwire] warning: failed to parse ${meshJsonPath}: ${msg}\n`);
     return null;
   }
 }
 
-// Built-in defaults (upstream CyberNord infra) — used only if mesh.json is absent
+// Built-in host fallbacks — the pre-refactor upstream topology. Preserved so
+// `OW_<NODE>_TS` / `OW_<NODE>_PUB` env vars that upstream's docs reference keep
+// working, and so getHostCandidates() returns a real 3-host chain in zero-config
+// deployments (not just `[node.host]`).
+function builtinHostFallbacks(): Record<string, HostFallback> {
+  return {
+    contabo:   { wg: '10.10.0.1', tailscale: process.env.OW_CONTABO_TS   ?? '', publicIp: process.env.OW_CONTABO_PUB   ?? '' },
+    hostinger: { wg: '10.10.0.2', tailscale: process.env.OW_HOSTINGER_TS ?? '', publicIp: process.env.OW_HOSTINGER_PUB ?? '' },
+    thinkpad:  { wg: '10.10.0.4', tailscale: process.env.OW_THINKPAD_TS  ?? '' },
+  };
+}
+
+// Seed HOST_FALLBACKS from builtin + env vars BEFORE loadMeshJson runs, so
+// mesh.json's per-node overrides win if both are set. Order: builtin → env →
+// mesh.json (last-write-wins in loadMeshJson).
+for (const [id, fb] of Object.entries(builtinHostFallbacks())) {
+  HOST_FALLBACKS[id] = fb;
+}
+
+// Built-in defaults — used only if mesh.json is absent or malformed.
 function builtinNodes(): MeshNode[] {
   return [
     { id: 'windows', alias: 'win', host: '127.0.0.1', port: 0, user: 'Admin', identityFile: '', os: 'windows', isLocal: true, tags: ['workstation', 'desktop'] },
@@ -122,17 +173,39 @@ function buildNodeRoles(rawNodes: MeshJsonNode[] | null): Record<string, NodeRol
 export const NODE_ROLES: Record<string, NodeRole> = buildNodeRoles(loaded?.rawNodes ?? null);
 
 // ─── Node resolution helpers ─────────────────────────────────────
-// Each follows: env var → mesh.json (by tag/role/isLocal) → built-in default
-// This means void's setup works with zero config, custom meshes work via
-// mesh.json, and individual overrides work via env vars.
+// Each follows: env var → mesh.json (by tag/role/isLocal) → built-in default.
 
-/** Which node am I? */
+/** Which node am I?
+ *  Resolution order:
+ *    1. OMNIWIRE_NODE_ID env var
+ *    2. mesh.json entry with isLocal: true
+ *    3. os.hostname() match against NODES[].id or NODES[].alias
+ *    4. process.platform === 'win32' ⇒ 'windows' (builtin windows node)
+ *    5. Throw — silently returning NODES[0] routes commands to a random remote
+ */
 export function getLocalNodeId(): string {
   if (process.env.OMNIWIRE_NODE_ID) return process.env.OMNIWIRE_NODE_ID;
   const local = NODES.find((n) => n.isLocal);
   if (local) return local.id;
-  if (process.platform === 'win32') return 'windows';
-  return NODES[0]?.id ?? 'local';
+
+  // Hostname match — useful when mesh.json lists this machine but forgot
+  // to set isLocal: true.
+  const hn = hostname().toLowerCase();
+  const byHost = NODES.find((n) => n.id.toLowerCase() === hn || n.alias.toLowerCase() === hn);
+  if (byHost) return byHost.id;
+
+  // Windows builtin doesn't set isLocal in the legacy const list, keep that
+  // path working on zero-config Windows installs.
+  if (process.platform === 'win32') {
+    const winNode = NODES.find((n) => n.id === 'windows');
+    if (winNode) return winNode.id;
+  }
+
+  throw new Error(
+    `[omniwire] could not determine local node id. Set OMNIWIRE_NODE_ID, ` +
+    `or add isLocal: true to one of the nodes in ${meshJsonPath}. ` +
+    `hostname=${hn}, available nodes=${NODES.map((n) => n.id).join(',')}`
+  );
 }
 
 /** Which node has the database (PostgreSQL / CyberBase)? */
@@ -210,26 +283,47 @@ export function allNodes(): MeshNode[] {
   return [...CONFIG.nodes];
 }
 
-// Get ordered list of hosts to try for a node
+// Get ordered list of hosts to try for a node (WG → Tailscale → Public IP).
 export function getHostCandidates(nodeId: string): string[] {
   const fb = HOST_FALLBACKS[nodeId];
   if (!fb) {
     const host = NODES.find((n) => n.id === nodeId)?.host;
     return host ? [host] : [];
   }
-  const hosts = [fb.wg];
+  const hosts: string[] = [];
+  if (fb.wg) hosts.push(fb.wg);
   if (fb.tailscale) hosts.push(fb.tailscale);
   if (fb.publicIp) hosts.push(fb.publicIp);
+  if (hosts.length === 0) {
+    const host = NODES.find((n) => n.id === nodeId)?.host;
+    if (host) hosts.push(host);
+  }
   return hosts;
 }
 
 // ─── Database credentials ────────────────────────────────────────
-// Resolution: CYBERSYNC_DB_URL → individual env vars → mesh.json dbNode host → defaults
+// Resolution: CYBERSYNC_DB_URL → individual OMNIWIRE_PG_* env vars → defaults.
+// Defaults are localhost-oriented: sync daemons assume Postgres is reachable
+// at 127.0.0.1 on the DB node (the node selected by getDbNode()). The
+// `psql` commands in mcp/server.ts run ON that node via SSH, so 127.0.0.1
+// means "the DB node's own loopback" — not the caller's machine.
 export interface DbCredentials {
   readonly host: string;
   readonly port: number;
   readonly user: string;
   readonly database: string;
+}
+
+// Emit a stderr warning at most once when credentials default across the board —
+// helps users notice misconfiguration before it turns into a connection refusal.
+let dbDefaultWarned = false;
+function warnDbDefaults(): void {
+  if (dbDefaultWarned) return;
+  dbDefaultWarned = true;
+  process.stderr.write(
+    `[omniwire] warning: no CYBERSYNC_DB_URL / OMNIWIRE_PG_* env vars set; ` +
+    `using defaults host=127.0.0.1 port=5432 user=cyberbase db=cyberbase\n`
+  );
 }
 
 export function getDbCredentials(): DbCredentials {
@@ -239,51 +333,37 @@ export function getDbCredentials(): DbCredentials {
       const u = new URL(dbUrl);
       return {
         host: u.hostname || '127.0.0.1',
-        port: u.port ? parseInt(u.port) : 5432,
+        port: parsePort(u.port, 5432),
         user: u.username || 'cyberbase',
         database: u.pathname.slice(1) || 'cyberbase',
       };
     } catch { /* fall through */ }
   }
+  const hostEnv = process.env.OMNIWIRE_PG_HOST;
+  const portEnv = process.env.OMNIWIRE_PG_PORT;
+  const userEnv = process.env.OMNIWIRE_PG_USER;
+  const dbEnv = process.env.OMNIWIRE_PG_DB;
+  if (!hostEnv && !portEnv && !userEnv && !dbEnv) warnDbDefaults();
   return {
-    host: process.env.OMNIWIRE_PG_HOST ?? '127.0.0.1',
-    port: parseInt(process.env.OMNIWIRE_PG_PORT ?? '5432'),
-    user: process.env.OMNIWIRE_PG_USER ?? 'cyberbase',
-    database: process.env.OMNIWIRE_PG_DB ?? 'cyberbase',
+    host: hostEnv ?? '127.0.0.1',
+    port: parsePort(portEnv, 5432),
+    user: userEnv ?? 'cyberbase',
+    database: dbEnv ?? 'cyberbase',
   };
 }
 
-/** Returns a psql command prefix suitable for SSH exec on the DB node */
+/** Returns a psql command prefix suitable for SSH exec on the DB node. */
 export function pgExecPrefix(): string {
   const c = getDbCredentials();
-  return `psql -h ${c.host} -U ${c.user} -d ${c.database}`;
-}
-
-// ─── Remote paths ────────────────────────────────────────────────
-/** Remote .omniwire directory (on target nodes, resolves user home) */
-export function getRemoteOmniDir(user?: string): string {
-  const u = user ?? 'root';
-  const homeDir = u === 'root' ? '/root' : `/home/${u}`;
-  return process.env.OMNIWIRE_REMOTE_DIR ?? `${homeDir}/.omniwire`;
+  return `psql -h ${c.host} -p ${c.port} -U ${c.user} -d ${c.database}`;
 }
 
 // ─── Vault paths ─────────────────────────────────────────────────
+// Used by sync/vault-bridge for the Obsidian mirror directory.
 export function getVaultPath(): string {
   if (process.env.OMNIWIRE_VAULT_PATH) return process.env.OMNIWIRE_VAULT_PATH;
   if (process.platform === 'win32') {
     return join(home, 'Documents', 'CyberBase');
   }
   return join(home, '.cyberbase', 'vault');
-}
-
-// ─── Description helpers ─────────────────────────────────────────
-/** Generic node description for tool schemas — avoids hardcoding specific node names */
-export function nodeDesc(role: 'db' | 'docker' | 'browser' | 'compute' | 'any'): string {
-  switch (role) {
-    case 'db': return `Node id. Default: auto-selected db/storage node.`;
-    case 'docker': return `Node id. Default: auto-selected docker node.`;
-    case 'browser': return `Node id. Default: auto-selected browser/GPU node.`;
-    case 'compute': return `Node id. Default: auto-selected compute node.`;
-    case 'any': return `Target node id. Default: auto-selected based on task.`;
-  }
 }
