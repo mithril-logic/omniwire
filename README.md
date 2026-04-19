@@ -766,7 +766,23 @@ omniwire_mesh_status()   # 88 tools should be available
 | `OMNIWIRE_VAULT_ROOT` | Optional | Path to Obsidian vault root (default: CyberBase vault) |
 | `CYBERSYNC_DB_URL` | Optional | PostgreSQL DSN — defaults to `postgresql://cyberbase@10.0.0.1:5432/cyberbase` |
 | `CYBERSYNC_STATEMENT_TIMEOUT_MS` | Optional | Postgres `statement_timeout` for the CyberSync pool, in ms. Default `10000`. `0` disables the timeout (Postgres semantics). Non-numeric or negative values are rejected with a stderr warning and the default is used. |
-| `OMNIWIRE_MESH_CONFIG` | Optional | Override mesh.json path |
+| `OMNIWIRE_MESH_JSON` | Optional | Override mesh.json path (default: `~/.omniwire/mesh.json`). Parse errors are logged to stderr and the built-in mesh is used. |
+| `OMNIWIRE_NODE_ID` | Optional | Override which mesh node this process identifies as. Default: `isLocal:true` node in mesh.json, else hostname match against node id/aliases, else built-in guess. |
+| `OMNIWIRE_DB_NODE` | Optional | Node id to route CyberBase DB traffic to. Default: first node tagged `db` in mesh.json, else built-in. |
+| `OMNIWIRE_DOCKER_NODE` | Optional | Node id for Docker operations. Default: first node tagged `docker`. |
+| `OMNIWIRE_BROWSER_NODE` | Optional | Node id for browser/CDP operations. Default: first node tagged `browser`. |
+| `OMNIWIRE_COMPUTE_NODE` | Optional | Node id for heavy compute. Default: first node tagged `compute` or `gpu`. |
+| `OMNIWIRE_PG_HOST` | Optional | Postgres host for CyberBase. Used only when `CYBERSYNC_DB_URL` is unset. Default: `127.0.0.1`. |
+| `OMNIWIRE_PG_PORT` | Optional | Postgres port. Non-numeric or out-of-range values fall back with a stderr warning. Default: `5432`. |
+| `OMNIWIRE_PG_USER` | Optional | Postgres user. Default: `cyberbase`. |
+| `OMNIWIRE_PG_DB` | Optional | Postgres database name. Default: `cyberbase`. |
+| `OMNIWIRE_VAULT_PATH` | Optional | Obsidian vault mirror directory used by `sync/vault-bridge`. Default: `~/Documents/CyberBase` on Windows, `~/.cyberbase/vault` elsewhere. |
+| `OW_PG_PASSWORD` | Optional | CyberSync Postgres password. Used only when not embedded in `CYBERSYNC_DB_URL`. |
+| `OW_CONTABO_TS` | Optional | Tailscale IP for the built-in `contabo` host fallback. Used after the WireGuard IP if both are set. |
+| `OW_HOSTINGER_TS` | Optional | Tailscale IP for the built-in `hostinger` host fallback. |
+| `OW_THINKPAD_TS` | Optional | Tailscale IP for the built-in `thinkpad` host fallback. |
+| `OW_CONTABO_PUB` | Optional | Public IP for the built-in `contabo` host fallback. Tried last after WireGuard + Tailscale. |
+| `OW_HOSTINGER_PUB` | Optional | Public IP for the built-in `hostinger` host fallback. |
 | `OMNIWIRE_WIN_HOME` | Optional | Local Windows home dir for CyberSync manifest discovery (default: `os.homedir()` on Windows, `C:/Users/Admin` elsewhere). Absolute path only; empty string is ignored. Affects local disk lookup only — cross-node path rewriting still uses the canonical `C:/Users/Admin` literal, so mixed-username meshes do not drift. |
 | `OMNIWIRE_LINUX_HOME` | Optional | Local Linux home dir for CyberSync manifest discovery (default: `/root` when running as root on Linux, `os.homedir()` for non-root Linux, `/root` elsewhere). Absolute path only; empty string is ignored. Affects local disk lookup only — cross-node path rewriting still uses the canonical `/root` literal. |
 | `OMNIWIRE_DARWIN_HOME` | Optional | Local macOS home dir for CyberSync manifest discovery (default: `os.homedir()`). Absolute path only; empty string is ignored. |
