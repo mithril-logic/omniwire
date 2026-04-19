@@ -27,6 +27,12 @@ export class SyncDB {
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
       statement_timeout: statementTimeoutMs,
+      // TCP keepalive: detect dead peers (host sleep, network drop) without
+      // waiting for the OS default ~2h. Pair with server-side
+      // idle_in_transaction_session_timeout so a client vanishing mid-
+      // transaction can't leave a locked zombie session.
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 60_000,
     });
   }
 
