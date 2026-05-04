@@ -1,0 +1,213 @@
+// OmniWire mesh topology — 2026-05-04
+//
+// Sources of truth this diagram reflects:
+//   - /Users/admin/claude/omniwire/AGENTS.md            (SSH host table, MCP transports, mesh nodes, A2A)
+//   - /Users/admin/claude/omniwire/SESSION-STATE.md     (current frozen state, per-node sync/MCP status)
+//   - /Users/admin/claude/omniwire/omniwire/src/protocol/config.ts  (canonical node config + resolution)
+//   - /Users/admin/claude/omniwire/omniwire/mesh.example.json       (mesh.json schema example)
+//
+// Edge style legend:
+//   solid black  = ACTIVE transport
+//   dashed red   = FROZEN transport (intentionally stopped after openclaw.json clobber incident)
+//   dotted blue  = informational / admin / out-of-band reference
+//
+// Render: dot -Tpng docs/arch/mesh-topology.dot -o mesh-topology.png
+
+digraph OmniWireMesh {
+    graph [
+        label="OmniWire mesh topology — 2026-05-04",
+        labelloc="t",
+        fontname="Helvetica",
+        fontsize=18,
+        rankdir=LR,
+        compound=true,
+        nodesep=0.4,
+        ranksep=0.8,
+        bgcolor="white"
+    ];
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ─────────────────────────────────────────────────────────────
+    // Mesh node default style: box
+    // Service default style: ellipse
+    // ─────────────────────────────────────────────────────────────
+
+    // ───── macbook host ─────
+    subgraph cluster_macbook {
+        label="macbook (darwin) — 100.96.226.53\nrole: dev / controller";
+        style="rounded,filled";
+        fillcolor="#eef5ff";
+        color="#3a6ea5";
+        fontname="Helvetica-Bold";
+
+        macbook [label="macbook\n(host)", shape=box, style="filled,bold", fillcolor="#cfe2ff"];
+        mb_mcp_stdio  [label="MCP stdio\n(per Claude Code session)\nlaunch.sh", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+        mb_mcp_sse    [label="MCP SSE\nlaunchd com.omniwire.mcp-sse\nbind 100.96.226.53:3200-3202\n(unloaded — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        mb_sync       [label="sync daemon\nlaunchd com.omniwire.sync\n(unloaded — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        mb_upstream   [label="upstream-watch\nlaunchd 6h poll\n→ GitHub issue", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+
+        macbook -> mb_mcp_stdio  [style=dotted, color="#3a6ea5", arrowhead=none];
+        macbook -> mb_mcp_sse    [style=dotted, color="#3a6ea5", arrowhead=none];
+        macbook -> mb_sync       [style=dotted, color="#3a6ea5", arrowhead=none];
+        macbook -> mb_upstream   [style=dotted, color="#3a6ea5", arrowhead=none];
+    }
+
+    // ───── windows host (windows + wsl share Tailscale IP 100.91.236.102) ─────
+    subgraph cluster_winhost {
+        label="Windows host — 100.91.236.102\n(windows native + WSL share this Tailscale IP)";
+        style="rounded,filled";
+        fillcolor="#fff5e6";
+        color="#a5743a";
+        fontname="Helvetica-Bold";
+
+        windows [label="windows\n(native, ssh port 22)\nrole: dev", shape=box, style="filled,bold", fillcolor="#ffe7c2"];
+        wsl     [label="wsl\n(Arch on WSL, ssh port 2222)\nrole: agent", shape=box, style="filled,bold", fillcolor="#ffe7c2"];
+
+        win_mcp_sse [label="MCP SSE\nScheduled Task OmniWireDaemon\nports 3210-3212 (offset)\n--no-sync, local-only", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+        win_sync    [label="scheduled task\nomniwire-sync\nstate: Ready (never run)", shape=ellipse, style="filled,dashed", fillcolor="#fde7e9"];
+
+        wsl_mcp_sse [label="MCP SSE\nsystemd --user omniwire-mcp\nports 3200-3202 on 0.0.0.0\n(stopped — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        wsl_sync    [label="sync daemon\nsystemd --user omniwire-sync\n(stopped — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        wsl_mcp_stdio [label="MCP stdio\n(per Claude Code/Codex session)", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+
+        windows -> win_mcp_sse [style=dotted, color="#a5743a", arrowhead=none];
+        windows -> win_sync    [style=dotted, color="#a5743a", arrowhead=none];
+        wsl     -> wsl_mcp_sse [style=dotted, color="#a5743a", arrowhead=none];
+        wsl     -> wsl_sync    [style=dotted, color="#a5743a", arrowhead=none];
+        wsl     -> wsl_mcp_stdio [style=dotted, color="#a5743a", arrowhead=none];
+    }
+
+    // ───── rei-pc host ─────
+    subgraph cluster_rei {
+        label="rei-pc (Pop!_OS / linux) — 100.97.44.9\nrole: services";
+        style="rounded,filled";
+        fillcolor="#f0e6ff";
+        color="#6a3aa5";
+        fontname="Helvetica-Bold";
+
+        rei [label="rei-pc\n(host)", shape=box, style="filled,bold", fillcolor="#dcc8ff"];
+        rei_mcp_sse [label="MCP SSE\nsystemd --user omniwire-mcp\nports 3200-3202 on 0.0.0.0\n(stopped — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        rei_sync    [label="sync daemon\nsystemd --user omniwire-sync\n(stopped — frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        rei_openclaw [label="OpenClaw gateway\n(stdio MCPs attached\nto user sessions)", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+
+        rei -> rei_mcp_sse  [style=dotted, color="#6a3aa5", arrowhead=none];
+        rei -> rei_sync     [style=dotted, color="#6a3aa5", arrowhead=none];
+        rei -> rei_openclaw [style=dotted, color="#6a3aa5", arrowhead=none];
+    }
+
+    // ───── tank host ─────
+    subgraph cluster_tank {
+        label="tank (TrueNAS) — 100.64.54.102\nrole: storage / git";
+        style="rounded,filled";
+        fillcolor="#e6fff0";
+        color="#3a8a5f";
+        fontname="Helvetica-Bold";
+
+        tank [label="tank\n(host)", shape=box, style="filled,bold", fillcolor="#c2f5d6"];
+        pg [label="omniwire-postgres\n(Docker container)\nDB: omniwire\ntcp 5432", shape=cylinder, style=filled, fillcolor="#fff7c2"];
+        forgejo [label="Forgejo\nssh 2223 / http 3000\norigin + fork remotes", shape=cylinder, style=filled, fillcolor="#fff7c2"];
+
+        tank -> pg      [style=dotted, color="#3a8a5f", arrowhead=none];
+        tank -> forgejo [style=dotted, color="#3a8a5f", arrowhead=none];
+    }
+
+    // ───── External: GitHub upstream ─────
+    github [
+        label="voidchecksum/omniwire\nGitHub upstream\n(read-only watch)",
+        shape=note,
+        style="filled",
+        fillcolor="#f4f4f4",
+        color="#666666"
+    ];
+
+    // ─────────────────────────────────────────────────────────────
+    // SSH (Tailscale, YubiKey FIDO2-SK only) — ACTIVE
+    //   macbook is the hub: it has outbound SSH to all peers.
+    //   wsl ↔ rei direct paths exist administratively but the mesh
+    //   in practice routes through macbook. windows has no outbound SSH.
+    // ─────────────────────────────────────────────────────────────
+
+    macbook -> wsl     [label="ssh / Tailscale\n:2222", color="black"];
+    macbook -> windows [label="ssh / Tailscale\n:22 (cmd.exe)", color="black"];
+    macbook -> rei     [label="ssh / Tailscale\n:22", color="black"];
+    macbook -> tank    [label="ssh / Tailscale\n:22 (admin)", color="black"];
+
+    // ─────────────────────────────────────────────────────────────
+    // Postgres TCP — ACTIVE (powers A2A + CyberSync persistence)
+    //   Each mesh node (with credentials) connects directly to tank:5432.
+    //   windows is --no-sync so it does NOT participate.
+    // ─────────────────────────────────────────────────────────────
+
+    macbook -> pg [label="pg tcp\n:5432\n(A2A + CyberSync)", color="black"];
+    wsl     -> pg [label="pg tcp\n:5432", color="black"];
+    rei     -> pg [label="pg tcp\n:5432", color="black"];
+
+    // ─────────────────────────────────────────────────────────────
+    // SFTP fanout (chokidar-watched paths) — FROZEN
+    //   Was the per-node sync transport. Stopped 2026-04-23 after
+    //   openclaw.json clobber-loop incident. Daemons unloaded; the
+    //   edges are drawn dashed-red to mark "wired but inert".
+    // ─────────────────────────────────────────────────────────────
+
+    edge [color="red", style=dashed, fontcolor="#a02020"];
+    mb_sync  -> wsl_sync    [label="sftp fanout\n(frozen)"];
+    mb_sync  -> rei_sync    [label="sftp fanout\n(frozen)"];
+    wsl_sync -> mb_sync     [label="sftp fanout\n(frozen)"];
+    wsl_sync -> rei_sync    [label="sftp fanout\n(frozen)"];
+    rei_sync -> mb_sync     [label="sftp fanout\n(frozen)"];
+    rei_sync -> wsl_sync    [label="sftp fanout\n(frozen)"];
+    edge [color="black", style=solid, fontcolor="black"]; // reset
+
+    // ─────────────────────────────────────────────────────────────
+    // Git remotes (admin / informational)
+    // ─────────────────────────────────────────────────────────────
+
+    macbook -> forgejo [label="git push/pull\nssh :2223\n(origin/fork)", style=dotted, color="#3060a0", fontcolor="#3060a0"];
+    mb_upstream -> github [label="https poll\n6h", style=dotted, color="#3060a0", fontcolor="#3060a0"];
+
+    // ─────────────────────────────────────────────────────────────
+    // Pi/OMP harness reaches macbook MCP SSE on 100.96.226.53:3210
+    // documented in AGENTS.md. SSE service is currently frozen, so
+    // this is a dashed-red edge.
+    // ─────────────────────────────────────────────────────────────
+
+    pi_omp [label="Pi / OMP harness\n(SSE client)", shape=note, style=filled, fillcolor="#f4f4f4", color="#666666"];
+    pi_omp -> mb_mcp_sse [label="SSE\n:3210 (frozen)", style=dashed, color="red", fontcolor="#a02020"];
+
+    // ─────────────────────────────────────────────────────────────
+    // Legend
+    // ─────────────────────────────────────────────────────────────
+
+    subgraph cluster_legend {
+        label="Legend";
+        fontname="Helvetica-Bold";
+        style="rounded,filled";
+        fillcolor="#fafafa";
+        color="#888888";
+        rank=sink;
+
+        l_mesh    [label="mesh node (host)", shape=box, style="filled,bold", fillcolor="#cfe2ff"];
+        l_service [label="service / daemon", shape=ellipse, style=filled, fillcolor="#e6f4ea"];
+        l_frozen  [label="service (frozen)", shape=ellipse, style=filled, fillcolor="#fde7e9"];
+        l_db      [label="db / git store", shape=cylinder, style=filled, fillcolor="#fff7c2"];
+        l_ext     [label="external", shape=note, style=filled, fillcolor="#f4f4f4"];
+
+        l_a [label="A", shape=plaintext];
+        l_b [label="B", shape=plaintext];
+        l_c [label="C", shape=plaintext];
+        l_d [label="D", shape=plaintext];
+        l_e [label="E", shape=plaintext];
+        l_f [label="F", shape=plaintext];
+
+        l_a -> l_b [label="active transport", color="black"];
+        l_c -> l_d [label="frozen transport", color="red", style=dashed, fontcolor="#a02020"];
+        l_e -> l_f [label="informational / admin", style=dotted, color="#3060a0", fontcolor="#3060a0"];
+
+        // Keep legend nodes laid out compactly
+        { rank=same; l_mesh; l_service; l_frozen; l_db; l_ext; }
+        { rank=same; l_a; l_b; }
+        { rank=same; l_c; l_d; }
+        { rank=same; l_e; l_f; }
+    }
+}
