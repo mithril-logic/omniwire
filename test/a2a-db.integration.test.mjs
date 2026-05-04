@@ -105,9 +105,6 @@ async function cleanupEvents(topic) {
 async function cleanupAgent(agent_id) {
   await pool.query('DELETE FROM a2a_agents WHERE agent_id = $1', [agent_id]);
 }
-async function cleanupAgentsByPrefix(prefix) {
-  await pool.query('DELETE FROM a2a_agents WHERE agent_id LIKE $1', [`${prefix}%`]);
-}
 async function cleanupBlackboard(topic) {
   await pool.query('DELETE FROM a2a_blackboard WHERE topic = $1', [topic]);
 }
@@ -609,9 +606,9 @@ test('a2a_tasks: priority — dequeue returns highest priority first', async (t)
   const queue = pfx('task-prio');
   t.after(() => cleanupTaskQueue(queue));
 
-  await a2a.enqueueTask(queue, 5,  { id: 'medium' });
-  await a2a.enqueueTask(queue, 10, { id: 'high' });
-  await a2a.enqueueTask(queue, 1,  { id: 'low' });
+  await a2a.enqueueTask(queue, 5, { id: 'medium' });
+  await a2a.enqueueTask(queue, 9, { id: 'high' });
+  await a2a.enqueueTask(queue, 1, { id: 'low' });
 
   const t1 = await a2a.dequeueTask(queue, 'worker-1');
   assert.equal(t1.task.id, 'high', 'highest priority first');

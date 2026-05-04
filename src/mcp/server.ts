@@ -3532,7 +3532,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       action: z.enum(['acquire', 'release', 'status', 'list']).describe('Action'),
       lock_name: z.string().optional().describe('Lock name (e.g., "deploy-prod", "db-migration")'),
       node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
-      owner: z.string().optional().describe('Owner/agent name. Required for acquire AND release — release fails if owner doesn\'t match the current lock holder.'),
+      owner: z.string().optional().describe('Owner/agent name. Defaults to "agent". For release, pass the SAME owner string used to acquire — release fails if owner doesn\'t match the current lock holder.'),
       ttl: z.number().optional().describe('Lock TTL in seconds (default: 300). Auto-releases after TTL.'),
     },
     async ({ action, lock_name, node, owner, ttl }) => {

@@ -316,7 +316,7 @@ There is no separate broadcast tool. Convention: agents subscribe by reading a k
 - For "deliver to exactly one agent of a pool", use `omniwire_a2a_message` — multiple workers `receive` from the same channel, `FOR UPDATE SKIP LOCKED` distributes work.
 - For "post a finding any agent might want", use `omniwire_blackboard` — append to topic, anyone can read.
 
-The convention for a "broadcast to all" message is: emit an event on a well-known topic (e.g., `agent-protocol`, `status-report`) and have every agent poll that topic on startup or on a timer. This is the pattern documented in the upper-level `AGENTS.md` A2A protocol section. There is no "recipient" column in `a2a_messages`; if you need targeted delivery, encode the recipient in the channel name (e.g. `to-scanner-1`) or in the message payload.
+The convention for a "broadcast to all" message is: post to a well-known blackboard topic and have every agent read that topic on startup or on a timer. The upper-level `AGENTS.md` A2A protocol section uses `omniwire_blackboard` for the `agent-protocol` (coordination instructions, read on session start) and `status-report` (task summaries on completion) topics. `omniwire_event` is an alternative for high-frequency event-style emissions where you want every poller to see every event without consuming it. There is no "recipient" column in `a2a_messages`; if you need targeted delivery, encode the recipient in the channel name (e.g. `to-scanner-1`) or in the message payload.
 
 ## Limitations and Open Work
 
@@ -332,16 +332,13 @@ The convention for a "broadcast to all" message is: emit an event on a well-know
 
 A2A is correct when a write on one node is visible to a read on another node. The cleanest cross-node check is a direct psql query — bypassing the MCP layer confirms the substrate, and bypassing the local node confirms the shared-DB property. The DB password is in `pass omniwire/db-password`.
 
-```bash
-# On macbook — post via the MCP tool. Substitute your client's invocation.
-# Example using SSE endpoint (client must speak MCP JSON-RPC):
-curl -sf -X POST http://127.0.0.1:3201/api/exec \
-  -H 'content-type: application/json' \
-  -d '{"node":"macbook","command":"echo verify-from-macbook"}'
-
-# Or, via any MCP client connected to the local stdio server:
+```
+# On macbook — post via the MCP tool from any connected client (stdio or SSE).
+# In an MCP client, invoke:
 #   omniwire_blackboard(action=post, topic=verify, content="hello from macbook", author=test)
+```
 
+```bash
 # Confirm cross-node visibility from rei-pc by querying Postgres directly:
 ssh rei-pc 'PGPASSWORD=$(pass omniwire/db-password) psql \
   -h 100.64.54.102 -U omniwire -d omniwire \
