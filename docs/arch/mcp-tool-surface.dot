@@ -1,0 +1,506 @@
+// OmniWire MCP tool surface — 88+ tools by domain
+//
+// Source of truth: src/mcp/server.ts (72 omniwire_* tools) +
+//                  src/mcp/sync-tools.ts (15 cybersync_*/omniwire_sync_* tools)
+//                  = 87 MCP tools (the "88+" headline counts the bg meta-tool wrapper).
+//
+// Structure:
+//   - Transports (stdio / SSE / REST / Events) feed the McpServer instance.
+//   - Tools are grouped into 12 domain clusters.
+//   - Internal modules (NodeManager, TransferEngine, ShellManager, A2aDb,
+//     SyncDB, eventBus) sit between the McpServer and the outside world.
+//   - External dependencies: SSH transport, Postgres on tank, local FS,
+//     Docker, Chromium/CDP, VPN backends, scrapling.
+//
+// Render:  dot -Tpng docs/arch/mcp-tool-surface.dot -o mcp-tool-surface.png
+
+digraph OmniWireMCP {
+  rankdir=LR;
+  compound=true;
+  splines=spline;
+  overlap=false;
+  newrank=true;
+  bgcolor="#0d1117";
+  fontname="Helvetica";
+  fontsize=12;
+  fontcolor="#e6edf3";
+  pad=0.4;
+  nodesep=0.35;
+  ranksep=0.85;
+
+  label="OmniWire MCP tool surface — 88+ tools by domain";
+  labelloc="t";
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=10,
+    fontcolor="#0d1117",
+    color="#30363d",
+  ];
+
+  edge [
+    color="#7d8590",
+    fontname="Helvetica",
+    fontsize=9,
+    fontcolor="#9da7b3",
+    arrowsize=0.7,
+  ];
+
+  // ============================================================
+  // TRANSPORTS (entry points into the McpServer)
+  // ============================================================
+  subgraph cluster_transports {
+    label="Transports — src/mcp/index.ts";
+    style="rounded,filled";
+    fillcolor="#161b22";
+    color="#58a6ff";
+    fontcolor="#58a6ff";
+
+    t_stdio  [label="stdio\n(--stdio)\nClaude Code, Codex, Gemini",  fillcolor="#a5d6ff"];
+    t_sse    [label="SSE\nrei:3200 / mac:3210\nGET /sse + POST /message",  fillcolor="#a5d6ff"];
+    t_rest   [label="REST\nport 3201\n/api/health, /api/nodes, ...",      fillcolor="#a5d6ff"];
+    t_ws     [label="WebSocket / SSE / Webhooks\n(events port 3202)\nsrc/mcp/events.ts", fillcolor="#a5d6ff"];
+  }
+
+  // ============================================================
+  // CORE — McpServer instance
+  // ============================================================
+  mcp_server [
+    label="McpServer\nsrc/mcp/server.ts (~5.6k LOC)\ncreateOmniWireServer(manager, transfer)\n+ background-task wrapper for every tool",
+    shape=box3d,
+    fillcolor="#ffd33d",
+    fontcolor="#1f2328",
+    style="filled",
+  ];
+
+  t_stdio  -> mcp_server [label="StdioServerTransport"];
+  t_sse    -> mcp_server [label="SSEServerTransport"];
+  t_rest   -> mcp_server [label="direct manager/transfer\n(bypasses MCP)"];
+  t_ws     -> mcp_server [label="eventBus.emit"];
+
+  // ============================================================
+  // INTERNAL MODULES (shared substrate)
+  // ============================================================
+  subgraph cluster_modules {
+    label="Internal modules";
+    style="rounded,filled";
+    fillcolor="#161b22";
+    color="#d2a8ff";
+    fontcolor="#d2a8ff";
+
+    mod_nm     [label="NodeManager\nsrc/nodes/manager.ts\nSSH2 sessions per node", fillcolor="#d2a8ff"];
+    mod_te     [label="TransferEngine\nsrc/nodes/transfer.ts\nSFTP up/down/sync",   fillcolor="#d2a8ff"];
+    mod_sh     [label="ShellManager\nsrc/nodes/shell.ts\npersistent shells",         fillcolor="#d2a8ff"];
+    mod_tun    [label="TunnelManager\nsrc/nodes/tunnel.ts\nSSH port-forwards",       fillcolor="#d2a8ff"];
+    mod_rt     [label="RealtimeChannel\nsrc/nodes/realtime.ts\nstream multiplexer",  fillcolor="#d2a8ff"];
+    mod_a2a    [label="A2aDb (NEW)\nsrc/mcp/a2a-db.ts\npg-backed coordination",      fillcolor="#7ee787", color="#3fb950", penwidth=2];
+    mod_syncdb [label="SyncDB\nsrc/sync/db.ts\nCyberSync items + heartbeats",        fillcolor="#d2a8ff"];
+    mod_engine [label="SyncEngine\nsrc/sync/engine.ts\nreconcile + diff",            fillcolor="#d2a8ff"];
+    mod_evbus  [label="eventBus\nsrc/mcp/events.ts\nwebhook + WS + SSE fanout",      fillcolor="#d2a8ff"];
+    mod_cb     [label="CyberBase (cbInit)\nsrc/cyberbase/*\nKV + knowledge store",   fillcolor="#d2a8ff"];
+  }
+
+  mcp_server -> mod_nm     [lhead=cluster_modules, style=invis];
+  // Real wiring is drawn by cluster->module edges below.
+
+  // ============================================================
+  // EXTERNAL DEPENDENCIES
+  // ============================================================
+  subgraph cluster_external {
+    label="External dependencies";
+    style="rounded,filled";
+    fillcolor="#161b22";
+    color="#f85149";
+    fontcolor="#f85149";
+
+    ext_ssh    [label="SSH (ssh2)\nFIDO2-SK key:\nomniwire-mesh ed25519",      fillcolor="#ffa198"];
+    ext_pg     [label="Postgres\non tank\n100.64.54.102:5432\nDB: omniwire",   fillcolor="#ffa198"];
+    ext_fs     [label="Local FS\n(node:fs)",                                   fillcolor="#ffa198"];
+    ext_docker [label="Docker daemon\n(unix socket)",                          fillcolor="#ffa198"];
+    ext_cdp    [label="Chromium / CDP\nplaywright + scrapling",                fillcolor="#ffa198"];
+    ext_vpn    [label="VPN backends\nmullvad / openvpn / wg",                  fillcolor="#ffa198"];
+    ext_scrap  [label="Scrapling MCP\nContabo:8931 systemd",                   fillcolor="#ffa198"];
+    ext_wg     [label="WireGuard / Tailscale\nOmniMesh fabric",                fillcolor="#ffa198"];
+    ext_pass   [label="pass / GPG\nsecret store",                              fillcolor="#ffa198"];
+  }
+
+  mod_nm     -> ext_ssh;
+  mod_te     -> ext_ssh   [label="SFTP"];
+  mod_sh     -> mod_nm;
+  mod_tun    -> ext_ssh   [label="-L/-R"];
+  mod_rt     -> mod_nm;
+  mod_a2a    -> ext_pg    [label="pg.Pool",  color="#3fb950", fontcolor="#3fb950"];
+  mod_syncdb -> ext_pg    [label="pg.Pool"];
+  mod_cb     -> ext_pg    [label="pg.Pool"];
+
+  // ============================================================
+  // CLUSTER 1: Execution & shell
+  // ============================================================
+  subgraph cluster_exec {
+    label="1. Execution & shell";
+    style="rounded,filled";
+    fillcolor="#0c2d1c";
+    color="#7ee787";
+    fontcolor="#7ee787";
+
+    c1_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#7ee787"><font color="#0d1117"><b>9 tools</b></font></td></tr>
+        <tr><td>omniwire_exec</td></tr>
+        <tr><td>omniwire_run</td></tr>
+        <tr><td>omniwire_batch</td></tr>
+        <tr><td>omniwire_broadcast</td></tr>
+        <tr><td>omniwire_pipeline</td></tr>
+        <tr><td>omniwire_shell</td></tr>
+        <tr><td>omniwire_bg</td></tr>
+        <tr><td>omniwire_kernel</td></tr>
+        <tr><td>omniwire_stream</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c1_tools -> mod_nm;
+  c1_tools -> mod_sh;
+  c1_tools -> mod_rt;
+
+  // ============================================================
+  // CLUSTER 2: Files & transfer
+  // ============================================================
+  subgraph cluster_files {
+    label="2. Files & transfer";
+    style="rounded,filled";
+    fillcolor="#0d2538";
+    color="#79c0ff";
+    fontcolor="#79c0ff";
+
+    c2_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#79c0ff"><font color="#0d1117"><b>5 tools</b></font></td></tr>
+        <tr><td>omniwire_read_file</td></tr>
+        <tr><td>omniwire_write_file</td></tr>
+        <tr><td>omniwire_transfer_file</td></tr>
+        <tr><td>omniwire_find_files</td></tr>
+        <tr><td>omniwire_list_files</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c2_tools -> mod_te;
+  c2_tools -> mod_nm;
+  c2_tools -> ext_fs [label="local-mode"];
+
+  // ============================================================
+  // CLUSTER 3: Process / system
+  // ============================================================
+  subgraph cluster_sys {
+    label="3. Process / system";
+    style="rounded,filled";
+    fillcolor="#2a1f0f";
+    color="#ffa657";
+    fontcolor="#ffa657";
+
+    c3_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#ffa657"><font color="#0d1117"><b>10 tools</b></font></td></tr>
+        <tr><td>omniwire_process_list</td></tr>
+        <tr><td>omniwire_service_control</td></tr>
+        <tr><td>omniwire_disk_usage</td></tr>
+        <tr><td>omniwire_tail_log</td></tr>
+        <tr><td>omniwire_live_monitor</td></tr>
+        <tr><td>omniwire_metrics</td></tr>
+        <tr><td>omniwire_healthcheck</td></tr>
+        <tr><td>omniwire_doctor</td></tr>
+        <tr><td>omniwire_node_info</td></tr>
+        <tr><td>omniwire_mesh_status</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c3_tools -> mod_nm;
+
+  // ============================================================
+  // CLUSTER 4: Network / mesh
+  // ============================================================
+  subgraph cluster_net {
+    label="4. Network / mesh";
+    style="rounded,filled";
+    fillcolor="#291734";
+    color="#d2a8ff";
+    fontcolor="#d2a8ff";
+
+    c4_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#d2a8ff"><font color="#0d1117"><b>10 tools</b></font></td></tr>
+        <tr><td>omniwire_network</td></tr>
+        <tr><td>omniwire_vpn</td></tr>
+        <tr><td>omniwire_firewall</td></tr>
+        <tr><td>omniwire_port_forward</td></tr>
+        <tr><td>omniwire_dns</td></tr>
+        <tr><td>omniwire_proxy</td></tr>
+        <tr><td>omniwire_cert</td></tr>
+        <tr><td>omniwire_mesh_expose</td></tr>
+        <tr><td>omniwire_mesh_gateway</td></tr>
+        <tr><td>omniwire_omnimesh</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c4_tools -> mod_nm;
+  c4_tools -> mod_tun [label="port_forward"];
+  c4_tools -> ext_vpn [label="vpn"];
+  c4_tools -> ext_wg  [label="omnimesh / mesh_*"];
+
+  // ============================================================
+  // CLUSTER 5: Containers / deploy
+  // ============================================================
+  subgraph cluster_deploy {
+    label="5. Containers / deploy";
+    style="rounded,filled";
+    fillcolor="#102a1d";
+    color="#56d364";
+    fontcolor="#56d364";
+
+    c5_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#56d364"><font color="#0d1117"><b>7 tools</b></font></td></tr>
+        <tr><td>omniwire_docker</td></tr>
+        <tr><td>omniwire_container</td></tr>
+        <tr><td>omniwire_deploy</td></tr>
+        <tr><td>omniwire_install_package</td></tr>
+        <tr><td>omniwire_update</td></tr>
+        <tr><td>omniwire_cron</td></tr>
+        <tr><td>omniwire_schedule</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c5_tools -> mod_nm;
+  c5_tools -> ext_docker [label="docker, container"];
+
+  // ============================================================
+  // CLUSTER 6: A2A coordination — Postgres-backed (HIGHLIGHTED)
+  // ============================================================
+  subgraph cluster_a2a {
+    label="6. A2A coordination — Postgres-backed (NEW)";
+    style="rounded,filled";
+    fillcolor="#0a2e1c";
+    color="#3fb950";
+    fontcolor="#3fb950";
+    penwidth=3;
+
+    c6_tools [label=<
+      <table border="0" cellborder="1" cellspacing="0" cellpadding="3">
+        <tr><td bgcolor="#3fb950"><font color="#0d1117"><b>6 tools — rewritten via A2aDb</b></font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_a2a_message</font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_blackboard</font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_agent_registry</font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_task_queue</font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_semaphore</font></td></tr>
+        <tr><td bgcolor="#163a26"><font color="#7ee787">omniwire_event (singular)</font></td></tr>
+        <tr><td><i>+ omniwire_agent_task (legacy)</i></td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+
+    c6_note [label="omniwire_event (singular)\nis A2A pub/sub — NOT to be\nconfused with omniwire_events\n(plural, webhook/SSE bus)",
+             shape=note, fillcolor="#fff8c5", fontcolor="#1f2328"];
+  }
+  c6_tools -> mod_a2a [color="#3fb950", penwidth=2, label="all 6"];
+
+  // ============================================================
+  // CLUSTER 7: Knowledge / persistence
+  // ============================================================
+  subgraph cluster_knowledge {
+    label="7. Knowledge / persistence";
+    style="rounded,filled";
+    fillcolor="#0d2538";
+    color="#a5d6ff";
+    fontcolor="#a5d6ff";
+
+    c7_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#a5d6ff"><font color="#0d1117"><b>15 tools</b></font></td></tr>
+        <tr><td>omniwire_knowledge</td></tr>
+        <tr><td>omniwire_store</td></tr>
+        <tr><td>omniwire_coc</td></tr>
+        <tr><td>omniwire_audit</td></tr>
+        <tr><td>omniwire_snippet</td></tr>
+        <tr><td>omniwire_secrets</td></tr>
+        <tr><td>cybersync_status</td></tr>
+        <tr><td>cybersync_sync_now</td></tr>
+        <tr><td>cybersync_diff</td></tr>
+        <tr><td>cybersync_history</td></tr>
+        <tr><td>cybersync_search_knowledge</td></tr>
+        <tr><td>cybersync_get_memory</td></tr>
+        <tr><td>cybersync_manifest</td></tr>
+        <tr><td>cybersync_force_push</td></tr>
+        <tr><td>cybersync_cookies</td></tr>
+        <tr><td>omniwire_sync*</td></tr>
+        <tr><td>omniwire_sync_rules / hooks / memory / agents</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c7_tools -> mod_cb     [label="knowledge / store / coc"];
+  c7_tools -> mod_syncdb [label="cybersync_*"];
+  c7_tools -> mod_engine [label="sync_now / diff / push"];
+  c7_tools -> ext_pass   [label="omniwire_secrets"];
+
+  // ============================================================
+  // CLUSTER 8: Browser / scrape
+  // ============================================================
+  subgraph cluster_browser {
+    label="8. Browser / scrape";
+    style="rounded,filled";
+    fillcolor="#2a1318";
+    color="#ff7b72";
+    fontcolor="#ff7b72";
+
+    c8_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#ff7b72"><font color="#0d1117"><b>4 tools</b></font></td></tr>
+        <tr><td>omniwire_cdp</td></tr>
+        <tr><td>omniwire_open_browser</td></tr>
+        <tr><td>omniwire_cookies</td></tr>
+        <tr><td>omniwire_scrape</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c8_tools -> ext_cdp;
+  c8_tools -> mod_nm;
+  c8_tools -> ext_scrap [label="scrape"];
+
+  // ============================================================
+  // CLUSTER 9: Events / streams (working bus)
+  // ============================================================
+  subgraph cluster_events {
+    label="9. Events / streams (bus, plural)";
+    style="rounded,filled";
+    fillcolor="#1d1c2e";
+    color="#bc8cff";
+    fontcolor="#bc8cff";
+
+    c9_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#bc8cff"><font color="#0d1117"><b>1 tool</b></font></td></tr>
+        <tr><td>omniwire_events (plural)</td></tr>
+        <tr><td><i>webhook / WS / SSE fan-out</i></td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c9_tools -> mod_evbus;
+  mod_evbus -> t_ws [style=dashed, label="fan-out"];
+
+  // ============================================================
+  // CLUSTER 10: Workflow / pipeline / meta
+  // ============================================================
+  subgraph cluster_workflow {
+    label="10. Workflow / pipeline / meta";
+    style="rounded,filled";
+    fillcolor="#2a1f0f";
+    color="#f0883e";
+    fontcolor="#f0883e";
+
+    c10_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#f0883e"><font color="#0d1117"><b>7 tools</b></font></td></tr>
+        <tr><td>omniwire_workflow</td></tr>
+        <tr><td>omniwire_pipeline</td></tr>
+        <tr><td>omniwire_capability</td></tr>
+        <tr><td>omniwire_alias</td></tr>
+        <tr><td>omniwire_plugin</td></tr>
+        <tr><td>omniwire_trace</td></tr>
+        <tr><td>omniwire_benchmark</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+
+    c10_note [label="omniwire_workflow (Tool 41)\nstill uses /tmp pattern —\nout of scope for current rewrite",
+              shape=note, fillcolor="#fff59d", fontcolor="#1f2328", color="#d29922", penwidth=2];
+  }
+  c10_tools -> mod_nm;
+  c10_tools -> mod_cb [label="capability/plugin"];
+
+  // ============================================================
+  // CLUSTER 11: Auth / secrets / 2FA
+  // ============================================================
+  subgraph cluster_auth {
+    label="11. Auth / secrets";
+    style="rounded,filled";
+    fillcolor="#2a1318";
+    color="#ff8b8b";
+    fontcolor="#ff8b8b";
+
+    c11_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#ff8b8b"><font color="#0d1117"><b>2 tools</b></font></td></tr>
+        <tr><td>omniwire_2fa</td></tr>
+        <tr><td>omniwire_user</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c11_tools -> mod_nm;
+  c11_tools -> ext_pass [label="2fa secrets"];
+
+  // ============================================================
+  // CLUSTER 12: Other (clipboard, alert, log, syslog, env, git, watch, backup)
+  // ============================================================
+  subgraph cluster_other {
+    label="12. Other (utilities)";
+    style="rounded,filled";
+    fillcolor="#161b22";
+    color="#8b949e";
+    fontcolor="#8b949e";
+
+    c12_tools [label=<
+      <table border="0" cellborder="0" cellspacing="2" cellpadding="2">
+        <tr><td bgcolor="#8b949e"><font color="#0d1117"><b>9 tools</b></font></td></tr>
+        <tr><td>omniwire_clipboard</td></tr>
+        <tr><td>omniwire_alert</td></tr>
+        <tr><td>omniwire_log_aggregate</td></tr>
+        <tr><td>omniwire_syslog</td></tr>
+        <tr><td>omniwire_env</td></tr>
+        <tr><td>omniwire_git</td></tr>
+        <tr><td>omniwire_watch</td></tr>
+        <tr><td>omniwire_backup</td></tr>
+        <tr><td>omniwire_deploy</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+  c12_tools -> mod_nm;
+  c12_tools -> mod_te [label="backup"];
+
+  // ============================================================
+  // McpServer -> tool clusters (logical grouping; rendered loosely
+  // so the layout engine can route around the cluster boxes)
+  // ============================================================
+  mcp_server -> c1_tools  [lhead=cluster_exec,      label="register"];
+  mcp_server -> c2_tools  [lhead=cluster_files];
+  mcp_server -> c3_tools  [lhead=cluster_sys];
+  mcp_server -> c4_tools  [lhead=cluster_net];
+  mcp_server -> c5_tools  [lhead=cluster_deploy];
+  mcp_server -> c6_tools  [lhead=cluster_a2a,       color="#3fb950", penwidth=2];
+  mcp_server -> c7_tools  [lhead=cluster_knowledge];
+  mcp_server -> c8_tools  [lhead=cluster_browser];
+  mcp_server -> c9_tools  [lhead=cluster_events];
+  mcp_server -> c10_tools [lhead=cluster_workflow];
+  mcp_server -> c11_tools [lhead=cluster_auth];
+  mcp_server -> c12_tools [lhead=cluster_other];
+
+  // Sync-tools.ts is registered as a side-effect of bootstrap
+  mcp_server -> mod_syncdb [style=dashed, label="registerSyncTools()\nsrc/mcp/sync-tools.ts (15 tools)"];
+
+  // Legend
+  subgraph cluster_legend {
+    label="Legend";
+    style="rounded,filled";
+    fillcolor="#161b22";
+    color="#30363d";
+    fontcolor="#8b949e";
+
+    legend [label=<
+      <table border="0" cellborder="1" cellspacing="0" cellpadding="4">
+        <tr><td bgcolor="#a5d6ff"><font color="#0d1117"><b>blue</b></font></td><td>transport entry point</td></tr>
+        <tr><td bgcolor="#ffd33d"><font color="#0d1117"><b>yellow</b></font></td><td>McpServer core</td></tr>
+        <tr><td bgcolor="#d2a8ff"><font color="#0d1117"><b>purple</b></font></td><td>internal module (NodeManager etc.)</td></tr>
+        <tr><td bgcolor="#7ee787"><font color="#0d1117"><b>green outline</b></font></td><td>A2A cluster — Postgres-backed (NEW)</td></tr>
+        <tr><td bgcolor="#ffa198"><font color="#0d1117"><b>red</b></font></td><td>external dependency</td></tr>
+        <tr><td bgcolor="#fff59d"><font color="#0d1117"><b>yellow note</b></font></td><td>caveat / out-of-scope</td></tr>
+      </table>
+    >, shape=plaintext, fontcolor="#e6edf3"];
+  }
+}
