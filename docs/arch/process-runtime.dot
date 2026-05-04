@@ -1,0 +1,338 @@
+// OmniWire process-runtime layout
+// ================================
+// Source of truth:
+//   - SESSION-STATE.md (2026-04-23 -> 24, openclaw clobber recovery)
+//   - src/mcp/index.ts  (transport selection: stdio | SSE | REST | events)
+//   - src/sync/index.ts (sync daemon entry, watcher loop)
+//   - ~/.omniwire/{launch.sh,launch-sync.sh,launch-sse.sh}
+//   - on-disk artifacts: ~/.omniwire/{sync,mcp-sse}.lock
+//
+// Convention:
+//   - shape=folder         -> supervisor unit (launchd/systemd/Task Scheduler)
+//   - shape=box3d          -> long-running daemon process
+//   - shape=note           -> lockfile / on-disk state
+//   - shape=component      -> Docker container (tank)
+//   - shape=cylinder       -> persistent storage (Postgres)
+//   - shape=oval           -> per-session transient process (stdio MCP)
+//
+// Color/style:
+//   - solid black border   -> active / running
+//   - dashed red border    -> intentionally STOPPED / FROZEN since 2026-04-23
+//   - dotted gray border   -> historical orphan (no supervisor) — incident artifact
+//
+// Render:
+//   dot -Tpng docs/arch/process-runtime.dot -o docs/arch/process-runtime.png
+//   dot -Tsvg docs/arch/process-runtime.dot -o docs/arch/process-runtime.svg
+
+digraph OmniwireProcessRuntime {
+    rankdir=TB;
+    compound=true;
+    newrank=true;
+    splines=spline;
+    nodesep=0.35;
+    ranksep=0.55;
+    fontname="Helvetica";
+    label=<<B>OmniWire process runtime — supervised daemons + MCP transports per node</B><BR/><FONT POINT-SIZE="10">Frozen 2026-04-23 after openclaw.json clobber + 19,384-restart MCP loop. Wave 1 lock/marker code built on macbook clone, not yet deployed.</FONT>>;
+    labelloc="t";
+    fontsize=14;
+
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---------- legend ----------
+    subgraph cluster_legend {
+        label="Legend";
+        style="rounded,dashed";
+        color="#888888";
+        fontsize=10;
+        rank=sink;
+
+        leg_sup    [label="supervisor", shape=folder, style=filled, fillcolor="#eef2ff"];
+        leg_daemon [label="daemon (active)", shape=box3d, style=filled, fillcolor="#f7f7f7"];
+        leg_frozen [label="daemon (FROZEN)", shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+        leg_orph   [label="orphan (historical)", shape=box3d, style="dotted,filled", color="#6b7280", fillcolor="#f3f4f6"];
+        leg_lock   [label="lockfile (~/.omniwire/*.lock)", shape=note, style=filled, fillcolor="#fffbeb"];
+        leg_ctn    [label="Docker container", shape=component, style=filled, fillcolor="#ecfdf5"];
+        leg_db     [label="persistent store", shape=cylinder, style=filled, fillcolor="#ecfdf5"];
+        leg_stdio  [label="stdio MCP (per-session)", shape=oval, style=filled, fillcolor="#fafafa"];
+
+        leg_sup -> leg_daemon [style=invis];
+        leg_daemon -> leg_frozen [style=invis];
+        leg_frozen -> leg_orph [style=invis];
+        leg_orph -> leg_lock [style=invis];
+        leg_lock -> leg_ctn [style=invis];
+        leg_ctn -> leg_db [style=invis];
+        leg_db -> leg_stdio [style=invis];
+    }
+
+    // ============================================================
+    // MACBOOK (darwin) — launchd user agents
+    // ============================================================
+    subgraph cluster_macbook {
+        label=<<B>macbook</B>  (darwin, 100.96.226.53)<BR/><FONT POINT-SIZE="9">~/Library/LaunchAgents/*.plist</FONT>>;
+        style="rounded,filled";
+        fillcolor="#f5f7ff";
+        color="#4338ca";
+        fontsize=11;
+
+        // Supervisors
+        mb_plist_sync   [label="com.omniwire.sync.plist\n(launchd user agent)", shape=folder, style=filled, fillcolor="#eef2ff"];
+        mb_plist_sse    [label="com.omniwire.mcp-sse.plist\n(launchd user agent)", shape=folder, style=filled, fillcolor="#eef2ff"];
+        mb_plist_uw     [label="com.omniwire.upstream-watch.plist\n(launchd, periodic)", shape=folder, style=filled, fillcolor="#eef2ff"];
+
+        // Wrappers
+        mb_wrap_sync    [label="~/.omniwire/launch-sync.sh", shape=cds, style=filled, fillcolor="#fef9c3"];
+        mb_wrap_sse     [label="~/.omniwire/launch-sse.sh", shape=cds, style=filled, fillcolor="#fef9c3"];
+        mb_wrap_uw      [label="~/.omniwire/upstream-watch.sh", shape=cds, style=filled, fillcolor="#fef9c3"];
+        mb_wrap_stdio   [label="~/.omniwire/launch.sh --stdio\n(spawned per Claude session)", shape=cds, style=filled, fillcolor="#fef9c3"];
+
+        // Daemons
+        mb_sync [label=<<B>node dist/sync/index.js</B><BR/>--node macbook<BR/>--omniwire-daemon=sync<BR/><FONT POINT-SIZE="9">FROZEN — launchd unloaded</FONT>>,
+                 shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+        mb_sse  [label=<<B>node dist/mcp/index.js</B><BR/>--sse-port=3210<BR/>--omniwire-daemon=mcp-sse<BR/><FONT POINT-SIZE="9">FROZEN — launchd unloaded</FONT>>,
+                 shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+        mb_uw   [label=<<B>upstream-watch</B><BR/>periodic git fetch<BR/><FONT POINT-SIZE="9">may still fire</FONT>>,
+                 shape=box3d, style=filled, fillcolor="#f7f7f7"];
+
+        // Per-session stdio MCPs (4 active per SESSION-STATE)
+        mb_stdio_pool [label=<<B>4x stdio MCPs</B><BR/>node dist/mcp/index.js --stdio<BR/><FONT POINT-SIZE="9">attached to Claude Code sessions</FONT>>,
+                       shape=oval, style=filled, fillcolor="#fafafa"];
+
+        // Lockfiles (on-disk; sync.lock + mcp-sse.lock present at ~/.omniwire/)
+        mb_lock_sync [label="~/.omniwire/sync.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+        mb_lock_sse  [label="~/.omniwire/mcp-sse.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+
+        // Edges: supervisor -> wrapper -> daemon
+        mb_plist_sync -> mb_wrap_sync [label="ProgramArguments"];
+        mb_wrap_sync  -> mb_sync       [label="exec node ..."];
+        mb_plist_sse  -> mb_wrap_sse   [label="ProgramArguments"];
+        mb_wrap_sse   -> mb_sse        [label="exec node ..."];
+        mb_plist_uw   -> mb_wrap_uw    [label="StartInterval"];
+        mb_wrap_uw    -> mb_uw         [label="exec"];
+
+        // stdio path is per-session (no plist)
+        mb_wrap_stdio -> mb_stdio_pool [label="spawn (Claude Code)"];
+
+        // flock contention
+        mb_sync -> mb_lock_sync [label="exclusive wx", color="#b91c1c", fontcolor="#b91c1c"];
+        mb_sse  -> mb_lock_sse  [label="exclusive wx (SSE-only)", color="#b91c1c", fontcolor="#b91c1c"];
+        // explicit annotation: stdio NEVER touches mcp-sse.lock
+        mb_stdio_pool -> mb_lock_sse [label="never touches", style=dashed, color="#94a3b8", fontcolor="#94a3b8", arrowhead=tee];
+    }
+
+    // ============================================================
+    // REI-PC (Pop!_OS) — systemd user units, services host
+    // ============================================================
+    subgraph cluster_rei {
+        label=<<B>rei-pc</B>  (Pop!_OS, 100.97.44.9) — services<BR/><FONT POINT-SIZE="9">~/.config/systemd/user/*.service</FONT>>;
+        style="rounded,filled";
+        fillcolor="#f0fdf4";
+        color="#15803d";
+        fontsize=11;
+
+        rei_unit_sync [label="omniwire-sync.service\n(systemd user)\nStartLimitBurst=5\nStartLimitIntervalSec=60",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+        rei_unit_mcp  [label="omniwire-mcp.service\n(systemd user)\nStartLimitBurst=5\nStartLimitIntervalSec=60",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+
+        rei_sync [label=<<B>node dist/sync/index.js</B><BR/>--node rei-pc<BR/>--omniwire-daemon=sync<BR/><FONT POINT-SIZE="9">FROZEN — systemctl stop</FONT>>,
+                  shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+        rei_mcp  [label=<<B>node dist/mcp/index.js</B><BR/>--sse-port=3200<BR/>--omniwire-daemon=mcp-sse<BR/><FONT POINT-SIZE="9">FROZEN — systemctl stop</FONT>>,
+                  shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+
+        // Historical orphan — held :3200, crashed mcp.service 19,384x
+        rei_orphan_mcp [label=<<B>ORPHAN (killed)</B><BR/>setsid nohup node dist/mcp/index.js<BR/>--sse-port=3200<BR/><FONT POINT-SIZE="9">launched 2026-04-17 via ssh+disown<BR/>held :3200; crashed sibling 19,384x<BR/>StartLimit guards added in response</FONT>>,
+                        shape=box3d, style="dotted,filled", color="#6b7280", fillcolor="#f3f4f6"];
+        rei_orphan_sync [label=<<B>ORPHAN (killed)</B><BR/>setsid nohup node dist/sync/index.js<BR/>--node rei-pc<BR/><FONT POINT-SIZE="9">duplicate sync writer<BR/>contributed to fanout loop</FONT>>,
+                         shape=box3d, style="dotted,filled", color="#6b7280", fillcolor="#f3f4f6"];
+
+        rei_lock_sync [label="~/.omniwire/sync.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+        rei_lock_sse  [label="~/.omniwire/mcp-sse.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+
+        // 3 active stdio MCPs per SESSION-STATE (children of openclaw-gateway)
+        rei_stdio_pool [label=<<B>3x stdio MCPs</B><BR/>node dist/mcp/index.js --stdio<BR/><FONT POINT-SIZE="9">children of openclaw-gateway</FONT>>,
+                        shape=oval, style=filled, fillcolor="#fafafa"];
+
+        rei_unit_sync -> rei_sync [label="ExecStart"];
+        rei_unit_mcp  -> rei_mcp  [label="ExecStart"];
+
+        rei_sync -> rei_lock_sync [label="exclusive wx", color="#b91c1c", fontcolor="#b91c1c"];
+        rei_mcp  -> rei_lock_sse  [label="exclusive wx (SSE-only)", color="#b91c1c", fontcolor="#b91c1c"];
+        rei_stdio_pool -> rei_lock_sse [label="never touches", style=dashed, color="#94a3b8", fontcolor="#94a3b8", arrowhead=tee];
+
+        // Orphan -> port collision narrative
+        rei_orphan_mcp -> rei_mcp [label="held :3200 → restart-loop", style=dotted, color="#6b7280", fontcolor="#6b7280"];
+    }
+
+    // ============================================================
+    // WSL (Arch on Windows host) — systemd user units
+    // ============================================================
+    subgraph cluster_wsl {
+        label=<<B>wsl</B>  (Arch, 100.91.236.102:2222) — agent<BR/><FONT POINT-SIZE="9">~/.config/systemd/user/*.service</FONT>>;
+        style="rounded,filled";
+        fillcolor="#f0fdf4";
+        color="#15803d";
+        fontsize=11;
+
+        wsl_unit_sync [label="omniwire-sync.service\n(systemd user)\nStartLimitBurst=5\nStartLimitIntervalSec=60",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+        wsl_unit_mcp  [label="omniwire-mcp.service\n(systemd user)\nStartLimitBurst=5\nStartLimitIntervalSec=60",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+
+        wsl_sync [label=<<B>node dist/sync/index.js</B><BR/>--node wsl<BR/>--omniwire-daemon=sync<BR/><FONT POINT-SIZE="9">FROZEN — systemctl stop<BR/>OLD CODE on remote</FONT>>,
+                  shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+        wsl_mcp  [label=<<B>node dist/mcp/index.js</B><BR/>--sse-port=3200<BR/>--omniwire-daemon=mcp-sse<BR/><FONT POINT-SIZE="9">FROZEN — systemctl stop<BR/>OLD CODE on remote</FONT>>,
+                  shape=box3d, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+
+        wsl_lock_sync [label="~/.omniwire/sync.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+        wsl_lock_sse  [label="~/.omniwire/mcp-sse.lock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+
+        wsl_unit_sync -> wsl_sync [label="ExecStart"];
+        wsl_unit_mcp  -> wsl_mcp  [label="ExecStart"];
+
+        wsl_sync -> wsl_lock_sync [label="exclusive wx", color="#b91c1c", fontcolor="#b91c1c"];
+        wsl_mcp  -> wsl_lock_sse  [label="exclusive wx (SSE-only)", color="#b91c1c", fontcolor="#b91c1c"];
+    }
+
+    // ============================================================
+    // WINDOWS (native) — Task Scheduler
+    // ============================================================
+    subgraph cluster_windows {
+        label=<<B>windows</B>  (native, 100.91.236.102:22) — dev<BR/><FONT POINT-SIZE="9">Task Scheduler tasks</FONT>>;
+        style="rounded,filled";
+        fillcolor="#f5f3ff";
+        color="#6d28d9";
+        fontsize=11;
+
+        win_task_sync [label="Scheduled Task\nomniwire-sync\n(state: Ready, never run)",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+        win_task_sse  [label="Scheduled Task\nomniwire-sse\n(state: Running)",
+                       shape=folder, style=filled, fillcolor="#eef2ff"];
+
+        win_sync [label=<<B>node dist/sync/index.js</B><BR/>--node windows<BR/><FONT POINT-SIZE="9">NEVER RUN<BR/>(task in Ready state)</FONT>>,
+                  shape=box3d, style="dashed,filled", color="#9ca3af", fillcolor="#f3f4f6"];
+        win_sse  [label=<<B>node dist/mcp/index.js</B><BR/>--sse-port=3210<BR/><FONT POINT-SIZE="9">RUNNING — unaffected by incident</FONT>>,
+                  shape=box3d, style=filled, fillcolor="#f7f7f7"];
+
+        win_task_sync -> win_sync [label="Action (when triggered)", style=dashed];
+        win_task_sse  -> win_sse  [label="Action"];
+    }
+
+    // ============================================================
+    // TANK (TrueNAS) — Docker host (storage / not a sync peer)
+    // ============================================================
+    subgraph cluster_tank {
+        label=<<B>tank</B>  (TrueNAS, 100.64.54.102) — storage<BR/><FONT POINT-SIZE="9">Docker daemon</FONT>>;
+        style="rounded,filled";
+        fillcolor="#ecfdf5";
+        color="#047857";
+        fontsize=11;
+
+        tank_docker [label="Docker daemon", shape=folder, style=filled, fillcolor="#eef2ff"];
+
+        tank_pg     [label=<<B>omniwire-postgres</B><BR/>postgres:17<BR/>:5432>,
+                     shape=component, style=filled, fillcolor="#ecfdf5"];
+        tank_forgejo [label=<<B>forgejo</B><BR/>HTTP :3000  SSH :2223>,
+                      shape=component, style=filled, fillcolor="#ecfdf5"];
+
+        tank_db     [label="omniwire DB\nsync_items, sync_events,\nnode_sync_state, knowledge,\nA2A tables", shape=cylinder, style=filled, fillcolor="#d1fae5"];
+
+        tank_docker -> tank_pg [label="container"];
+        tank_docker -> tank_forgejo [label="container"];
+        tank_pg -> tank_db [label="serves"];
+    }
+
+    // ============================================================
+    // CROSS-NODE DATA EDGES — sync writers / SSE clients / DB
+    // ============================================================
+
+    // Sync daemons all write to the same Postgres
+    mb_sync  -> tank_db [label="sync_events / sync_items\n(when active)", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+    rei_sync -> tank_db [label="sync_events / sync_items\n(when active)", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+    wsl_sync -> tank_db [label="sync_events / sync_items\n(when active)", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+
+    // MCP SSE / stdio also persist via SyncDB pool (--no-sync skips daemon init only;
+    // SyncDB pool init still happens after the recent A2A fix).
+    mb_sse        -> tank_db [label="A2A / knowledge\n(SyncDB pool)", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+    rei_mcp       -> tank_db [label="A2A / knowledge", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+    wsl_mcp       -> tank_db [label="A2A / knowledge", style=dashed, color="#9ca3af", fontcolor="#6b7280"];
+    win_sse       -> tank_db [label="A2A / knowledge", color="#374151", fontcolor="#374151"];
+    mb_stdio_pool -> tank_db [label="A2A / knowledge\n(--no-sync still inits SyncDB pool\n  post-A2A-fix)", color="#374151", fontcolor="#374151"];
+    rei_stdio_pool-> tank_db [label="A2A / knowledge", color="#374151", fontcolor="#374151"];
+
+    // ============================================================
+    // LIFECYCLE LEGEND (states/transitions outside any cluster)
+    // ============================================================
+    subgraph cluster_lifecycle {
+        label=<<B>Daemon lifecycle</B>>;
+        style="rounded,dashed";
+        color="#475569";
+        fontsize=10;
+
+        lc_boot     [label="boot / login", shape=ellipse, style=filled, fillcolor="#e0e7ff"];
+        lc_super    [label="supervisor loads unit", shape=box, style=filled, fillcolor="#eef2ff"];
+        lc_wrap     [label="launch-*.sh wrapper\n(sets env, exec node)", shape=box, style=filled, fillcolor="#fef9c3"];
+        lc_lock     [label="acquire flock\n(fs.openSync, 'wx')", shape=note, style=filled, fillcolor="#fffbeb"];
+        lc_running  [label="Node daemon running\n(--omniwire-daemon=<sync|mcp-sse>)", shape=box3d, style=filled, fillcolor="#f7f7f7"];
+        lc_term     [label="SIGINT / SIGTERM", shape=ellipse, style=filled, fillcolor="#fee2e2"];
+        lc_release  [label="release flock\n(SIGINT/SIGTERM/exit)", shape=note, style=filled, fillcolor="#fffbeb"];
+        lc_exit     [label="process.exit(0)", shape=ellipse, style=filled, fillcolor="#fee2e2"];
+        lc_crash    [label="crash / non-zero exit", shape=ellipse, style=filled, fillcolor="#fee2e2"];
+        lc_restart  [label="supervisor restart\n(StartLimitBurst=5\nin 60s window — circuit breaker)", shape=box, style=filled, fillcolor="#eef2ff"];
+        lc_contend  [label="another instance holds lock\n→ exit code 3", shape=box, style="dashed,filled", color="#b91c1c", fillcolor="#fef2f2"];
+
+        lc_boot    -> lc_super  [label="trigger"];
+        lc_super   -> lc_wrap   [label="exec ProgramArguments / ExecStart"];
+        lc_wrap    -> lc_lock   [label="node ... --omniwire-daemon=<kind>"];
+        lc_lock    -> lc_running [label="success"];
+        lc_lock    -> lc_contend [label="EEXIST", color="#b91c1c", fontcolor="#b91c1c"];
+        lc_running -> lc_term   [label="signal"];
+        lc_term    -> lc_release;
+        lc_release -> lc_exit;
+        lc_running -> lc_crash  [label="bug"];
+        lc_crash   -> lc_restart [label="exit code != 0"];
+        lc_restart -> lc_super  [label="back-off / re-exec"];
+    }
+
+    // ============================================================
+    // Frozen-state annotation (separate float box)
+    // ============================================================
+    subgraph cluster_frozen {
+        label=<<B>Frozen since 2026-04-23</B>>;
+        style="rounded,filled";
+        color="#b91c1c";
+        fillcolor="#fef2f2";
+        fontsize=10;
+
+        frozen_note [shape=note, style=filled, fillcolor="#fff5f5", color="#b91c1c",
+                     label=<
+<B>Mesh intentionally stopped after openclaw.json clobber.</B><BR/>
+<BR/>
+- macbook: <B>launchctl unload</B> on com.omniwire.{sync,mcp-sse}.plist<BR/>
+- rei-pc:  <B>systemctl --user stop</B> omniwire-{sync,mcp}.service + orphans killed<BR/>
+- wsl:     <B>systemctl --user stop</B> omniwire-{sync,mcp}.service<BR/>
+- windows: omniwire-sync task in <I>Ready</I> (never ran); SSE on :3210 unaffected<BR/>
+- tank:    Postgres + Forgejo containers untouched<BR/>
+<BR/>
+Wave 1 fix (built on macbook, NOT deployed to wsl/rei):<BR/>
+  • <B>flock</B> via fs.openSync(path, 'wx') on sync.lock + mcp-sse.lock<BR/>
+  • <B>--omniwire-daemon=&lt;sync|mcp-sse&gt;</B> marker arg (parse-and-ignore)<BR/>
+    → distinguishes supervised vs orphan in <FONT FACE="Courier">pgrep -af</FONT><BR/>
+  • <B>StartLimitBurst=5 / StartLimitIntervalSec=60</B> in systemd units<BR/>
+    → would have stopped the 19,384-restart MCP loop<BR/>
+  • <B>upsertItem mutated flag</B> — pushFile gates pushToRemoteNodes<BR/>
+    → kills the SFTP fanout echo loop<BR/>
+<BR/>
+SyncDB pool init no longer skipped by --no-sync (post-A2A fix):<BR/>
+  stdio MCPs and SSE MCPs both still hit Postgres for A2A + knowledge.
+                     >];
+    }
+
+    // ============================================================
+    // Ranks / hints
+    // ============================================================
+    { rank=same; mb_plist_sync; mb_plist_sse; mb_plist_uw; }
+    { rank=same; rei_unit_sync; rei_unit_mcp; }
+    { rank=same; wsl_unit_sync; wsl_unit_mcp; }
+    { rank=same; win_task_sync; win_task_sse; }
+}
