@@ -47,7 +47,7 @@ export class SyncEngine {
     const sensitive = isSensitivePath(storedRelPath) && hasEncryptionKey();
     const content = sensitive ? encrypt(data, loadOrCreateKey()) : data;
 
-    const item = await this.db.upsertItem({
+    const { item, mutated } = await this.db.upsertItem({
       tool,
       category: categorizeFile(storedRelPath),
       relPath: storedRelPath,
@@ -59,6 +59,9 @@ export class SyncEngine {
       encrypted: sensitive,
     });
 
+    // Keep node_sync_state fresh unconditionally — it's cheap and ensures
+    // our per-node bookkeeping reflects the current content_hash even when
+    // the sync_items row was already up-to-date.
     await this.db.upsertNodeSync(this.config.nodeId, item.id, hash);
 
     // Mirror to Obsidian vault
@@ -68,7 +71,11 @@ export class SyncEngine {
       // Vault write failed (non-critical)
     }
 
-    if (!opts?.skipRemotePush) {
+    // Only fan out to peers over SFTP when the DB row actually changed.
+    // Without this guard, an incoming SFTP write re-fires chokidar on the
+    // receiver, which calls pushFile, which pushes back to all peers —
+    // producing a self-sustaining distributed echo loop.
+    if (!opts?.skipRemotePush && mutated) {
       await this.pushToRemoteNodes(item);
     }
   }
