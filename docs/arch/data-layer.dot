@@ -1,0 +1,321 @@
+// OmniWire data layer — Postgres on tank (omniwire DB)
+//
+// Source of truth:
+//   - src/sync/schema.ts          — all CREATE TABLE / INDEX statements
+//   - src/sync/db.ts              — SyncDB pool + helpers (sync_items, knowledge, ...)
+//   - src/sync/engine.ts          — pushFile / pushToRemoteNodes (sync flow)
+//   - src/sync/watcher.ts         — chokidar consolidated watcher
+//   - src/mcp/server.ts           — MCP tool handlers (cb(), a2a_message, blackboard)
+//   - src/mcp/a2a-db.ts           — direct-pg A2A queries (post-c7b4dba branch)
+//
+// Render: dot -Tpng docs/arch/data-layer.dot -o docs/arch/data-layer.png
+
+digraph data_layer {
+  rankdir=LR;
+  compound=true;
+  newrank=true;
+  fontname="Helvetica";
+  fontsize=11;
+  labelloc="t";
+  labeljust="c";
+  label=<<b>OmniWire data layer — Postgres on tank (omniwire DB)</b><br/>
+         <font point-size="10">tank @ 100.64.54.102:5432 — schema=public — pool=pg.Pool (src/sync/db.ts)</font>>;
+
+  node  [fontname="Helvetica", fontsize=10];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // ==========================================================================
+  // POSTGRES — main cluster (DB: omniwire)
+  // ==========================================================================
+  subgraph cluster_postgres {
+    label=<<b>postgres @ tank</b> (DB: <i>omniwire</i>)>;
+    style="rounded,filled";
+    fillcolor="#fafafa";
+    color="#888";
+    fontsize=12;
+
+    // ----------------------------------------------------------------------
+    // Pre-existing CyberSync tables (blue)
+    // ----------------------------------------------------------------------
+    subgraph cluster_cybersync {
+      label=<<b>CyberSync</b> (pre-existing)>;
+      style="rounded,filled";
+      fillcolor="#eef5ff";
+      color="#5b8dd6";
+
+      sync_items [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>sync_items|id UUID PK\lUNIQUE(tool, rel_path)\lcontent BYTEA · content_hash\lcontent_size BIGINT\lmetadata JSONB\lupdated_at · updated_by_node\lis_deleted BOOLEAN\lencrypted BOOLEAN (v2.2)\l}"
+      ];
+
+      node_sync_state [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>node_sync_state|PK(node_id, item_id)\litem_id → sync_items.id\l(ON DELETE CASCADE)\lcontent_hash · synced_at\l}"
+      ];
+
+      sync_events [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>sync_events|id BIGSERIAL\litem_id → sync_items.id\l(ON DELETE SET NULL)\lnode_id · event_type\ldetail · created_at\l}"
+      ];
+
+      knowledge [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>knowledge|id UUID PK\lUNIQUE(source_tool, key)\lvalue JSONB\lGIN FTS(key + value::text)\l}"
+      ];
+
+      claude_memory [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>claude_memory|id BIGSERIAL\lUNIQUE(node_id, key)\lvalue TEXT · ingested_at\l}"
+      ];
+
+      node_heartbeats [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#cfe2ff",
+        color="#1e3a5f",
+        label="{<h>node_heartbeats|node_id PK\llast_seen TIMESTAMPTZ\litems_count · pending_sync\l}"
+      ];
+
+      // FK relations (intra-CyberSync)
+      node_sync_state -> sync_items [
+        label="FK item_id\nON DELETE CASCADE",
+        arrowhead=odot, color="#1e3a5f", style=dashed, fontsize=8
+      ];
+      sync_events -> sync_items [
+        label="FK item_id\nON DELETE SET NULL",
+        arrowhead=odot, color="#1e3a5f", style=dashed, fontsize=8
+      ];
+    }
+
+    // ----------------------------------------------------------------------
+    // New A2A tables (green)
+    // ----------------------------------------------------------------------
+    subgraph cluster_a2a {
+      label=<<b>A2A</b> (new — c7b4dba branch)>;
+      style="rounded,filled";
+      fillcolor="#eaf7ee";
+      color="#3c9c5b";
+
+      a2a_messages [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_messages|id UUID PK\lchannel · sender · schema_kind\lmessage TEXT\lsent_at · consumed_at · consumed_by\l\lpartial idx (channel, sent_at)\lWHERE consumed_at IS NULL\l}"
+      ];
+
+      a2a_locks [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_locks|name TEXT PK\lowner · acquired_at\lexpires_at TIMESTAMPTZ\lidx on expires_at\l}"
+      ];
+
+      a2a_events [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_events|id UUID PK\ltopic · source · data\lts TIMESTAMPTZ\lidx (topic, ts DESC)\l}"
+      ];
+
+      a2a_agents [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_agents|agent_id PK\lcapabilities TEXT[] (GIN)\lmetadata · node_id\llast_heartbeat (TTL computed)\l}"
+      ];
+
+      a2a_blackboard [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_blackboard|id UUID PK\ltopic · author · content\lsource_node · posted_at\l\lGIN FTS(content)\lidx (topic, posted_at DESC)\l}"
+      ];
+
+      a2a_tasks [
+        shape=record,
+        style="filled,rounded",
+        fillcolor="#c9ecd2",
+        color="#1d6a35",
+        label="{<h>a2a_tasks|id UUID PK\lqueue · priority · task JSONB\lstatus · enqueued_at\lstarted_at · finished_at\lworker · result · error\l\lpartial idx (queue, priority DESC,\l  enqueued_at) WHERE status='pending'\l}"
+      ];
+
+      // No FKs between A2A tables — intentional (independent stores)
+    }
+  }
+
+  // ==========================================================================
+  // OTHER schemas / users on the same Postgres (for honesty)
+  // ==========================================================================
+  subgraph cluster_neighbors {
+    label=<<b>same Postgres — other schemas</b>>;
+    style="rounded,dashed";
+    fillcolor="#f7f7f7";
+    color="#bbb";
+
+    crm_contacts [
+      shape=box, style="filled,rounded",
+      fillcolor="#fff7e0", color="#a07030",
+      label="crm.contacts\n(CRM data — separate schema)"
+    ];
+    wolf_schema [
+      shape=box, style="filled,rounded",
+      fillcolor="#fff7e0", color="#a07030",
+      label="wolf.*\n(separate project schema)"
+    ];
+    cybersync_role [
+      shape=box, style="filled,rounded",
+      fillcolor="#fff7e0", color="#a07030",
+      label="role: cybersync\n(user-app DB role)"
+    ];
+  }
+
+  // ==========================================================================
+  // PROCESSES — sync flow (frozen) + A2A flow + knowledge ingest
+  // ==========================================================================
+  subgraph cluster_sync_flow {
+    label=<<b>Sync flow</b> <font color="#cc2222">(FROZEN — see SESSION-STATE.md)</font>>;
+    style="rounded,filled";
+    fillcolor="#fff5f5";
+    color="#cc2222";
+
+    fs_local [shape=ellipse, style="filled", fillcolor="#fde0e0", label="local file modified\n(disk)"];
+    chokidar [shape=ellipse, style="filled", fillcolor="#fde0e0", label="chokidar watcher\nsrc/sync/watcher.ts"];
+    push_file [shape=ellipse, style="filled", fillcolor="#fde0e0", label="engine.pushFile()\nsrc/sync/engine.ts\n→ hash + namespacePerNodePath"];
+    sftp_fanout [shape=ellipse, style="filled", fillcolor="#fde0e0", label="pushToRemoteNodes()\nSFTP fan-out (ssh2)\n— guarded by mutated flag\n  (Wave 1 loop-breaker)"];
+    receiver [shape=ellipse, style="filled", fillcolor="#fde0e0", label="peer node\nchokidar fires\n(LOOP — clobbered openclaw.json\n2026-04-23)"];
+  }
+
+  subgraph cluster_a2a_flow {
+    label=<<b>A2A flow</b> (Postgres-direct, post-fix)>;
+    style="rounded,filled";
+    fillcolor="#f0fbf3";
+    color="#2d8c4e";
+
+    agent_mac    [shape=ellipse, style="filled", fillcolor="#d6f0de", label="agent on macbook\nclaude-code MCP"];
+    mcp_handler  [shape=ellipse, style="filled", fillcolor="#d6f0de", label="MCP handler\nsrc/mcp/server.ts (Tool 43)\n→ a2aDb.postBlackboard(...)"];
+    a2a_db_mod   [shape=ellipse, style="filled", fillcolor="#d6f0de", label="src/mcp/a2a-db.ts\nINSERT via shared pg.Pool\n(SyncDB.getPool())"];
+    agent_rei    [shape=ellipse, style="filled", fillcolor="#d6f0de", label="agent on rei-pc\nblackboard read\n→ SELECT ORDER BY posted_at\n   LIMIT 20"];
+    msg_recv     [shape=ellipse, style="filled", fillcolor="#d6f0de",
+      label="a2a_messages receive\nSELECT ... FOR UPDATE\nSKIP LOCKED\n(safe concurrent dequeue)"];
+  }
+
+  subgraph cluster_knowledge_flow {
+    label=<<b>Knowledge ingest</b> (legacy psql shell-exec)>;
+    style="rounded,filled";
+    fillcolor="#fbf5e8";
+    color="#a07030";
+
+    cb_caller [shape=ellipse, style="filled", fillcolor="#f5e8c8",
+      label="cb('source_tool', 'key', value)\nstill used by:\n  • store · audit · 2fa\n  • ✗ blackboard (dropped in c7b4dba)"];
+    psql_wrap [shape=ellipse, style="filled", fillcolor="#f5e8c8",
+      label="legacy psql shell-exec wrapper\nmanager.exec(getDbNode(), pgExec(SQL))\n(silently dropped 1000+ blackboard writes)"];
+  }
+
+  // ==========================================================================
+  // EDGES — sync flow (red dashed = frozen)
+  // ==========================================================================
+  fs_local      -> chokidar     [color="#cc2222", style=dashed, label="fs event"];
+  chokidar      -> push_file    [color="#cc2222", style=dashed, label="debounced"];
+  push_file     -> sync_items   [color="#cc2222", style=dashed,
+                                  label="db.upsertItem()\nON CONFLICT (tool, rel_path)\n→ {item, mutated}"];
+  push_file     -> node_sync_state [color="#cc2222", style=dashed,
+                                  label="db.upsertNodeSync()\n(unconditional)"];
+  push_file     -> sftp_fanout  [color="#cc2222", style=dashed, label="if mutated"];
+  sftp_fanout   -> receiver     [color="#cc2222", style=dashed, label="SFTP write"];
+  receiver      -> chokidar     [color="#cc2222", style=dashed, label="re-fires (echo loop)"];
+  push_file     -> sync_events  [color="#cc2222", style=dashed, label="db.logEvent()"];
+
+  // ==========================================================================
+  // EDGES — A2A flow (green solid)
+  // ==========================================================================
+  agent_mac    -> mcp_handler  [color="#2d8c4e", label="omniwire_blackboard\n(post)"];
+  mcp_handler  -> a2a_db_mod   [color="#2d8c4e", label="postBlackboard()"];
+  a2a_db_mod   -> a2a_blackboard [color="#2d8c4e",
+    label="INSERT via pg.Pool\n(no SSH, no /tmp)"];
+  agent_rei    -> a2a_blackboard [color="#2d8c4e", dir=back,
+    label="SELECT ... ORDER BY\nposted_at DESC LIMIT 20"];
+  msg_recv     -> a2a_messages [color="#2d8c4e", dir=back,
+    label="FOR UPDATE SKIP LOCKED\n(atomic mark consumed)"];
+  a2a_db_mod   -> a2a_messages [color="#2d8c4e", style=dotted, label="send / receive"];
+  a2a_db_mod   -> a2a_locks    [color="#2d8c4e", style=dotted, label="acquire / expire"];
+  a2a_db_mod   -> a2a_events   [color="#2d8c4e", style=dotted, label="emit / poll"];
+  a2a_db_mod   -> a2a_agents   [color="#2d8c4e", style=dotted, label="register / heartbeat"];
+  a2a_db_mod   -> a2a_tasks    [color="#2d8c4e", style=dotted,
+    label="enqueue / dequeue\n(SKIP LOCKED)"];
+
+  // ==========================================================================
+  // EDGES — knowledge ingest (orange)
+  // ==========================================================================
+  cb_caller -> psql_wrap [color="#a07030",
+    label="ssh + psql -c \"INSERT ...\""];
+  psql_wrap -> knowledge [color="#a07030",
+    label="UPSERT ON CONFLICT\n(source_tool, key)"];
+
+  // ==========================================================================
+  // NOT-IN-DATABASE — honesty cluster
+  // ==========================================================================
+  subgraph cluster_void {
+    label=<<b>NOT in the database</b> (the void)>;
+    style="rounded,dashed";
+    fillcolor="#fafafa";
+    color="#666";
+
+    void_prompts [shape=note, style="filled", fillcolor="#eee", color="#666",
+      label="prompts / transcripts\n— never stored anywhere shared\n— inference-time only"];
+    void_sessions [shape=note, style="filled", fillcolor="#eee", color="#666",
+      label="session logs\n— macbook-only\n  ~/.claude/logs/*.jsonl"];
+    void_a2a_pre [shape=note, style="filled", fillcolor="#eee", color="#666",
+      label="A2A messages PRE-fix\n— /tmp on each node\n— never persisted (THE BUG)"];
+
+    void_label [shape=plaintext, fontcolor="#888", fontsize=10,
+      label=<<i>void: ephemeral, per-node,\nor never captured</i>>];
+  }
+
+  // ==========================================================================
+  // RANK / LAYOUT HINTS
+  // ==========================================================================
+  { rank=same; sync_items; a2a_messages; }
+  { rank=same; node_sync_state; sync_events; a2a_locks; a2a_events; }
+  { rank=same; knowledge; claude_memory; a2a_agents; a2a_blackboard; a2a_tasks; }
+
+  // legend
+  subgraph cluster_legend {
+    label=<<b>legend</b>>;
+    style="rounded,filled";
+    fillcolor="#ffffff";
+    color="#999";
+    fontsize=10;
+
+    legend_box [shape=plaintext, label=<
+      <table border="0" cellborder="1" cellspacing="0" cellpadding="4">
+        <tr><td bgcolor="#cfe2ff">CyberSync table (pre-existing)</td></tr>
+        <tr><td bgcolor="#c9ecd2">A2A table (new — c7b4dba)</td></tr>
+        <tr><td bgcolor="#fde0e0">frozen sync process (red dashed edges)</td></tr>
+        <tr><td bgcolor="#d6f0de">A2A process (green edges)</td></tr>
+        <tr><td bgcolor="#f5e8c8">knowledge ingest (orange edges)</td></tr>
+        <tr><td>FK with ON DELETE — open-circle dashed</td></tr>
+        <tr><td>SKIP LOCKED / partial idx — table annotation</td></tr>
+      </table>
+    >];
+  }
+}
