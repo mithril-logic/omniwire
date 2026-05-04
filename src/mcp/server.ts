@@ -11,6 +11,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 
 import { join, dirname } from 'node:path';
 import type { NodeManager } from '../nodes/manager.js';
 import type { TransferEngine } from '../nodes/transfer.js';
+import { type A2aDb, REGISTRY_DEFAULT_TTL_SEC } from './a2a-db.js';
 import { ShellManager, kernelExec } from '../nodes/shell.js';
 import { RealtimeChannel } from '../nodes/realtime.js';
 import { TunnelManager } from '../nodes/tunnel.js';
@@ -579,7 +580,7 @@ async function cbSemanticSearch(query: string, limit: number = 10): Promise<stri
 }
 // -----------------------------------------------------------------------------
 
-export function createOmniWireServer(manager: NodeManager, transfer: TransferEngine): McpServer {
+export function createOmniWireServer(manager: NodeManager, transfer: TransferEngine, a2aDb: A2aDb): McpServer {
   const server = new McpServer({
     name: 'omniwire',
     version: '3.0.1',
@@ -3468,51 +3469,58 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       schema: z.enum(['text', 'json', 'any']).optional().describe('Message format validation. json=must be valid JSON, text=plain string, any=no validation (default).'),
     },
     async ({ action, channel, node, message, sender, count, schema }) => {
-      const nodeId = node ?? getDbNode();
-      const queueDir = '/tmp/.omniwire-a2a';
-
-      if (action === 'send') {
-        if (!channel || !message) return fail('channel and message required');
-        // Schema validation
-        if (schema === 'json') {
-          try { JSON.parse(message); } catch { return fail('schema=json but message is not valid JSON'); }
+      // `node` is informational — A2A state lives in shared Postgres now.
+      void node;
+      try {
+        if (action === 'send') {
+          if (!channel || !message) return fail('channel and message required');
+          if (schema === 'json') {
+            try { JSON.parse(message); } catch { return fail('schema=json but message is not valid JSON'); }
+          }
+          const { id } = await a2aDb.sendMessage(channel, sender ?? 'unknown', schema ?? 'any', message);
+          return okBrief(`${channel}: sent (${message.length} chars, id ${id})`);
         }
-        const ts = Date.now();
-        const id = `${ts}-${Math.random().toString(36).slice(2, 6)}`;
-        const payload = JSON.stringify({ id, ts, sender: sender ?? 'unknown', schema: schema ?? 'any', message });
-        const escaped = payload.replace(/'/g, "'\\''");
-        const result = await manager.exec(nodeId, `mkdir -p ${queueDir}/${channel} && echo '${escaped}' >> ${queueDir}/${channel}/queue`);
-        return result.code === 0
-          ? okBrief(`${channel}: message sent (${message.length} chars)`)
-          : fail(result.stderr);
-      }
 
-      if (action === 'receive') {
-        if (!channel) return fail('channel required');
-        const n = count ?? 1;
-        const result = await manager.exec(nodeId, `head -${n} ${queueDir}/${channel}/queue 2>/dev/null && sed -i '1,${n}d' ${queueDir}/${channel}/queue 2>/dev/null || echo '(empty queue)'`);
-        return ok(nodeId, result.durationMs, result.stdout, `a2a recv ${channel}`);
-      }
+        if (action === 'receive') {
+          if (!channel) return fail('channel required');
+          const n = count ?? 1;
+          const consumer = sender ?? 'unknown';
+          const rows = await a2aDb.receiveMessages(channel, n, consumer);
+          if (rows.length === 0) return okBrief(`${channel}: (empty queue)`);
+          const body = rows
+            .map((r) => `${r.id} [${r.sender}] ${r.message.slice(0, 120)}`)
+            .join('\n');
+          return okBrief(`${channel}: ${rows.length} message${rows.length === 1 ? '' : 's'} received\n${body}`);
+        }
 
-      if (action === 'peek') {
-        if (!channel) return fail('channel required');
-        const n = count ?? 5;
-        const result = await manager.exec(nodeId, `head -${n} ${queueDir}/${channel}/queue 2>/dev/null || echo '(empty queue)'`);
-        return ok(nodeId, result.durationMs, result.stdout, `a2a peek ${channel}`);
-      }
+        if (action === 'peek') {
+          if (!channel) return fail('channel required');
+          const n = count ?? 5;
+          const rows = await a2aDb.peekMessages(channel, n);
+          if (rows.length === 0) return okBrief(`${channel}: (empty queue)`);
+          const body = rows
+            .map((r) => `${r.id} [${r.sender}] ${r.message.slice(0, 120)}`)
+            .join('\n');
+          return okBrief(`${channel}: ${rows.length} pending (peek)\n${body}`);
+        }
 
-      if (action === 'list_channels') {
-        const result = await manager.exec(nodeId, `ls -1 ${queueDir}/ 2>/dev/null || echo '(no channels)'`);
-        return ok(nodeId, result.durationMs, result.stdout, 'a2a channels');
-      }
+        if (action === 'list_channels') {
+          const channels = await a2aDb.listChannels();
+          if (channels.length === 0) return okBrief('(no channels)');
+          const body = channels.map((c) => `${c.channel}\t${c.pending} pending`).join('\n');
+          return okBrief(`channels (${channels.length}):\n${body}`);
+        }
 
-      if (action === 'clear') {
-        if (!channel) return fail('channel required');
-        await manager.exec(nodeId, `rm -f ${queueDir}/${channel}/queue`);
-        return okBrief(`${channel}: cleared`);
-      }
+        if (action === 'clear') {
+          if (!channel) return fail('channel required');
+          const deleted = await a2aDb.clearChannel(channel);
+          return okBrief(`${channel}: cleared (${deleted} removed)`);
+        }
 
-      return fail('invalid action');
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
+      }
     }
   );
 
@@ -3528,48 +3536,51 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       ttl: z.number().optional().describe('Lock TTL in seconds (default: 300). Auto-releases after TTL.'),
     },
     async ({ action, lock_name, node, owner, ttl }) => {
-      const nodeId = node ?? getDbNode();
-      const lockDir = '/tmp/.omniwire-locks';
+      void node; // informational — locks now live in shared Postgres
       const ttlSec = ttl ?? 300;
+      const ownerName = owner ?? 'agent';
 
-      if (action === 'acquire') {
-        if (!lock_name) return fail('lock_name required');
-        const lockFile = `${lockDir}/${lock_name}.lock`;
-        const ownerName = owner ?? 'agent';
-        const now = Date.now();
-        // Simple atomic lock: mkdir as atomic test-and-set, write owner info inside
-        const acquireScript = [
-          `mkdir -p ${lockDir}`,
-          `if mkdir ${lockFile}.d 2>/dev/null; then`,
-          `  echo '${ownerName}:${now}:${ttlSec}' > ${lockFile}`,
-          `  echo 'acquired'`,
-          `else`,
-          `  cat ${lockFile} 2>/dev/null || echo 'locked (unknown owner)'`,
-          `fi`,
-        ].join('\n');
-        const result = await manager.exec(nodeId, acquireScript);
-        return okBrief(`${lock_name}: ${result.stdout.trim()}`);
+      try {
+        if (action === 'acquire') {
+          if (!lock_name) return fail('lock_name required');
+          const res = await a2aDb.acquireLock(lock_name, ownerName, ttlSec);
+          if (res.acquired) return okBrief(`${lock_name}: acquired by ${ownerName} (ttl ${ttlSec}s)`);
+          const cur = res.current;
+          if (cur) {
+            const remaining = Math.max(0, Math.round((cur.expires_at.getTime() - Date.now()) / 1000));
+            return okBrief(`${lock_name}: locked by ${cur.owner} (${remaining}s remaining)`);
+          }
+          return okBrief(`${lock_name}: locked (unknown owner)`);
+        }
+
+        if (action === 'release') {
+          if (!lock_name) return fail('lock_name required');
+          const res = await a2aDb.releaseLock(lock_name, ownerName);
+          return okBrief(res.released ? `${lock_name}: released` : `${lock_name}: not held by ${ownerName}`);
+        }
+
+        if (action === 'status') {
+          if (!lock_name) return fail('lock_name required');
+          const row = await a2aDb.lockStatus(lock_name);
+          if (!row) return okBrief(`${lock_name}: (unlocked)`);
+          const remaining = Math.max(0, Math.round((row.expires_at.getTime() - Date.now()) / 1000));
+          return okBrief(`${lock_name}: held by ${row.owner} (${remaining}s remaining)`);
+        }
+
+        if (action === 'list') {
+          const rows = await a2aDb.listLocks();
+          if (rows.length === 0) return okBrief('(no locks)');
+          const body = rows.map((r) => {
+            const remaining = Math.max(0, Math.round((r.expires_at.getTime() - Date.now()) / 1000));
+            return `${r.name}: ${r.owner} (${remaining}s)`;
+          }).join('\n');
+          return okBrief(`locks (${rows.length}):\n${body}`);
+        }
+
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
       }
-
-      if (action === 'release') {
-        if (!lock_name) return fail('lock_name required');
-        await manager.exec(nodeId, `rm -f ${lockDir}/${lock_name}.lock && rmdir ${lockDir}/${lock_name}.lock.d 2>/dev/null`);
-        return okBrief(`${lock_name}: released`);
-      }
-
-      if (action === 'status') {
-        if (!lock_name) return fail('lock_name required');
-        const result = await manager.exec(nodeId, `cat ${lockDir}/${lock_name}.lock 2>/dev/null || echo '(unlocked)'`);
-        return okBrief(`${lock_name}: ${result.stdout.trim()}`);
-      }
-
-      if (action === 'list') {
-        const cmd = "for f in " + lockDir + "/*.lock 2>/dev/null; do [ -f \"$f\" ] && echo \"$(basename $f .lock): $(cat $f)\"; done 2>/dev/null || echo '(no locks)'";
-        const result = await manager.exec(nodeId, cmd);
-        return ok(nodeId, result.durationMs, result.stdout, 'locks');
-      }
-
-      return fail('invalid action');
     }
   );
 
@@ -3588,50 +3599,46 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       filter: z.string().optional().describe('Regex filter applied to event data during poll. Only matching events returned.'),
     },
     async ({ action, topic, node, data, source, since, limit, filter }) => {
-      const nodeId = node ?? getDbNode();
-      const eventDir = '/tmp/.omniwire-events';
+      void node; // informational — events now in shared Postgres
       const n = limit ?? 10;
 
-      if (action === 'emit') {
-        if (!topic) return fail('topic required');
-        const event = JSON.stringify({ ts: Date.now(), topic, source: source ?? 'agent', data: data ?? '' });
-        const escaped = event.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${eventDir} && echo '${escaped}' >> ${eventDir}/events.log`);
-        return okBrief(`event emitted: ${topic}`);
-      }
-
-      if (action === 'poll') {
-        let cmd: string;
-        if (topic && since) {
-          cmd = `grep '"topic":"${topic}"' ${eventDir}/events.log 2>/dev/null | awk -F'"ts":' '{split($2,a,","); if(a[1]>${since}) print}' | tail -${n}`;
-        } else if (topic) {
-          cmd = `grep '"topic":"${topic}"' ${eventDir}/events.log 2>/dev/null | tail -${n}`;
-        } else if (since) {
-          cmd = `awk -F'"ts":' '{split($2,a,","); if(a[1]>${since}) print}' ${eventDir}/events.log 2>/dev/null | tail -${n}`;
-        } else {
-          cmd = `tail -${n} ${eventDir}/events.log 2>/dev/null || echo '(no events)'`;
+      try {
+        if (action === 'emit') {
+          if (!topic) return fail('topic required');
+          const { id, ts } = await a2aDb.emitEvent(topic, source ?? 'agent', data ?? '');
+          return okBrief(`event emitted: ${topic} (id ${id}, ts ${ts.getTime()})`);
         }
-        // Apply regex filter on event data if specified
-        if (filter) {
-          const escapedFilter = filter.replace(/'/g, "'\\''");
-          cmd = `(${cmd}) | grep -E '${escapedFilter}' 2>/dev/null`;
+
+        if (action === 'poll') {
+          const sinceMs = since !== undefined && since !== '' ? Number(since) : undefined;
+          if (sinceMs !== undefined && !Number.isFinite(sinceMs)) return fail('since must be epoch ms');
+          const rows = await a2aDb.pollEvents({
+            topic,
+            since: sinceMs,
+            limit: n,
+            filter,
+          });
+          if (rows.length === 0) return okBrief(`(no events${topic ? ` for ${topic}` : ''})`);
+          const body = rows
+            .map((r) => `${r.ts.getTime()} [${r.topic}] ${r.source}: ${r.data.slice(0, 120)}`)
+            .join('\n');
+          return okBrief(`events ${topic ?? 'all'}: ${rows.length} returned\n${body}`);
         }
-        const result = await manager.exec(nodeId, cmd);
-        return ok(nodeId, result.durationMs, result.stdout || '(no events)', `events ${topic ?? 'all'}`);
-      }
 
-      if (action === 'history') {
-        const result = await manager.exec(nodeId, `wc -l ${eventDir}/events.log 2>/dev/null | awk '{print $1}'`);
-        const count = result.stdout.trim() || '0';
-        return okBrief(`${count} events total`);
-      }
+        if (action === 'history') {
+          const count = await a2aDb.eventHistoryCount();
+          return okBrief(`${count} events total`);
+        }
 
-      if (action === 'clear') {
-        await manager.exec(nodeId, `rm -f ${eventDir}/events.log`);
-        return okBrief('events cleared');
-      }
+        if (action === 'clear') {
+          const removed = await a2aDb.clearEvents(topic);
+          return okBrief(`events cleared${topic ? ` for ${topic}` : ''} (${removed} removed)`);
+        }
 
-      return fail('invalid action');
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
+      }
     }
   );
 
@@ -3725,40 +3732,51 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       capability: z.string().optional().describe('Capability to search for (discover action)'),
     },
     async ({ action, node, agent_id, capabilities, metadata, capability }) => {
+      // The `node` parameter still names the agent's home node for registry rows.
       const nodeId = node ?? getDbNode();
-      const regDir = '/tmp/.omniwire-agents';
 
-      if (action === 'register') {
-        if (!agent_id) return fail('agent_id required');
-        const entry = JSON.stringify({ id: agent_id, capabilities: capabilities ?? [], metadata: metadata ?? '{}', ts: Date.now(), node: nodeId });
-        const escaped = entry.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${regDir} && echo '${escaped}' > ${regDir}/${agent_id}.json`);
-        return okBrief(`agent ${agent_id} registered (${(capabilities ?? []).join(', ')})`);
+      try {
+        if (action === 'register') {
+          if (!agent_id) return fail('agent_id required');
+          await a2aDb.registerAgent(agent_id, capabilities ?? [], metadata ?? '{}', nodeId);
+          return okBrief(`agent ${agent_id} registered (${(capabilities ?? []).join(', ') || 'no caps'}) on ${nodeId}`);
+        }
+
+        if (action === 'deregister') {
+          if (!agent_id) return fail('agent_id required');
+          const res = await a2aDb.deregisterAgent(agent_id);
+          return okBrief(res.removed ? `agent ${agent_id} deregistered` : `agent ${agent_id} not found`);
+        }
+
+        if (action === 'heartbeat') {
+          if (!agent_id) return fail('agent_id required');
+          const res = await a2aDb.heartbeatAgent(agent_id);
+          return okBrief(res.touched ? `agent ${agent_id} heartbeat` : `agent ${agent_id} not registered`);
+        }
+
+        if (action === 'discover') {
+          if (!capability) return fail('capability required for discover');
+          const rows = await a2aDb.discoverAgents(capability, REGISTRY_DEFAULT_TTL_SEC);
+          if (rows.length === 0) return okBrief('(no agents with that capability)');
+          const body = rows
+            .map((r) => `${r.agent_id}@${r.node_id} [${r.capabilities.join(', ')}] hb=${r.last_heartbeat.toISOString()}`)
+            .join('\n');
+          return okBrief(`discover ${capability}: ${rows.length}\n${body}`);
+        }
+
+        if (action === 'list') {
+          const rows = await a2aDb.listAgents(REGISTRY_DEFAULT_TTL_SEC);
+          if (rows.length === 0) return okBrief('(no agents)');
+          const body = rows
+            .map((r) => `${r.agent_id}@${r.node_id} [${r.capabilities.join(', ')}] hb=${r.last_heartbeat.toISOString()}`)
+            .join('\n');
+          return okBrief(`agent registry: ${rows.length}\n${body}`);
+        }
+
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
       }
-
-      if (action === 'deregister') {
-        if (!agent_id) return fail('agent_id required');
-        await manager.exec(nodeId, `rm -f ${regDir}/${agent_id}.json`);
-        return okBrief(`agent ${agent_id} deregistered`);
-      }
-
-      if (action === 'heartbeat') {
-        if (!agent_id) return fail('agent_id required');
-        await manager.exec(nodeId, `[ -f ${regDir}/${agent_id}.json ] && tmp=$(cat ${regDir}/${agent_id}.json) && echo "$tmp" | sed 's/"ts":[0-9]*/"ts":${Date.now()}/' > ${regDir}/${agent_id}.json`);
-        return okBrief(`agent ${agent_id} heartbeat`);
-      }
-
-      if (action === 'discover' && capability) {
-        const result = await manager.exec(nodeId, `grep -l '"${capability}"' ${regDir}/*.json 2>/dev/null | xargs -I{} cat {} 2>/dev/null`);
-        return ok(nodeId, result.durationMs, result.stdout || '(no agents with that capability)', `discover ${capability}`);
-      }
-
-      if (action === 'list') {
-        const result = await manager.exec(nodeId, `cat ${regDir}/*.json 2>/dev/null || echo '(no agents)'`);
-        return ok(nodeId, result.durationMs, result.stdout, 'agent registry');
-      }
-
-      return fail('invalid action');
     }
   );
 
@@ -3776,44 +3794,56 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       limit: z.number().optional().describe('Max entries (default: 20)'),
     },
     async ({ action, node, topic, content, author, query, limit }) => {
-      const nodeId = node ?? getDbNode();
-      const bbDir = '/tmp/.omniwire-blackboard';
+      void node; // informational — blackboard now in shared Postgres
       const n = limit ?? 20;
+      const localNode = getLocalNodeId();
 
-      if (action === 'post') {
-        if (!topic || !content) return fail('topic and content required');
-        const entry = JSON.stringify({ ts: Date.now(), author: author ?? 'agent', content });
-        const escaped = entry.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${bbDir} && echo '${escaped}' >> ${bbDir}/${topic}.log`);
-        cb('blackboard', `${topic}:${Date.now()}`, entry);  // persist to CyberBase
-        return okBrief(`posted to ${topic} (${content.length} chars) [node + cyberbase]`);
+      try {
+        if (action === 'post') {
+          if (!topic || !content) return fail('topic and content required');
+          const { id } = await a2aDb.postBlackboard(topic, author ?? 'agent', content, localNode);
+          return okBrief(`posted to ${topic} (${content.length} chars, id ${id})`);
+        }
+
+        if (action === 'read') {
+          if (!topic) return fail('topic required');
+          const rows = await a2aDb.readBlackboard(topic, { limit: n });
+          if (rows.length === 0) return okBrief(`board ${topic}: (empty)`);
+          const body = rows
+            .map((r) => `${r.posted_at.toISOString()} [${r.author}@${r.source_node}] ${r.content.slice(0, 200)}`)
+            .join('\n');
+          return okBrief(`board ${topic}: ${rows.length} entries\n${body}`);
+        }
+
+        if (action === 'topics') {
+          const rows = await a2aDb.blackboardTopics();
+          if (rows.length === 0) return okBrief('(no topics)');
+          const body = rows
+            .map((r) => `${r.topic}\t${r.entries} entries\tlatest=${r.latest.toISOString()}`)
+            .join('\n');
+          return okBrief(`blackboard topics: ${rows.length}\n${body}`);
+        }
+
+        if (action === 'search') {
+          if (!query) return fail('query required for search');
+          const rows = await a2aDb.searchBlackboard(query, { topic, limit: n });
+          if (rows.length === 0) return okBrief(`search:${query} (no matches)`);
+          const body = rows
+            .map((r) => `${r.posted_at.toISOString()} [${r.topic}/${r.author}] ${r.content.slice(0, 200)}`)
+            .join('\n');
+          return okBrief(`search:${query}: ${rows.length} matches\n${body}`);
+        }
+
+        if (action === 'clear') {
+          if (!topic) return fail('topic required');
+          const removed = await a2aDb.clearBlackboard(topic);
+          return okBrief(`board ${topic} cleared (${removed} removed)`);
+        }
+
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
       }
-
-      if (action === 'read') {
-        if (!topic) return fail('topic required');
-        const result = await manager.exec(nodeId, `tail -${n} ${bbDir}/${topic}.log 2>/dev/null || echo '(empty board)'`);
-        return ok(nodeId, result.durationMs, result.stdout, `board:${topic}`);
-      }
-
-      if (action === 'topics') {
-        const result = await manager.exec(nodeId, `ls -1 ${bbDir}/*.log 2>/dev/null | xargs -I{} sh -c 'echo "$(basename {} .log) $(wc -l < {})"' 2>/dev/null || echo '(no topics)'`);
-        return ok(nodeId, result.durationMs, result.stdout, 'blackboard topics');
-      }
-
-      if (action === 'search' && query) {
-        const escaped = query.replace(/'/g, "'\\''");
-        const topicFilter = topic ? `${bbDir}/${topic}.log` : `${bbDir}/*.log`;
-        const result = await manager.exec(nodeId, `grep -h '${escaped}' ${topicFilter} 2>/dev/null | tail -${n}`);
-        return ok(nodeId, result.durationMs, result.stdout || '(no matches)', `search:${query}`);
-      }
-
-      if (action === 'clear') {
-        if (!topic) return fail('topic required');
-        await manager.exec(nodeId, `rm -f ${bbDir}/${topic}.log`);
-        return okBrief(`board ${topic} cleared`);
-      }
-
-      return fail('invalid action');
     }
   );
 
@@ -3832,51 +3862,57 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       error: z.string().optional().describe('Error message for fail'),
     },
     async ({ action, node, queue, task, priority, task_id, result: taskResult, error: taskError }) => {
-      const nodeId = node ?? getDbNode();
+      void node; // informational — task queue now in shared Postgres
       const qName = queue ?? 'default';
-      const qDir = `/tmp/.omniwire-taskq/${qName}`;
+      const worker = getLocalNodeId();
 
-      if (action === 'enqueue') {
-        if (!task) return fail('task required');
-        const id = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const pri = priority ?? 5;
-        const entry = JSON.stringify({ id, priority: pri, ts: Date.now(), status: 'pending', task: JSON.parse(task) });
-        const escaped = entry.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${qDir} && echo '${escaped}' > ${qDir}/${pri}_${id}.task`);
-        return okBrief(`enqueued ${id} (priority ${pri})`);
+      try {
+        if (action === 'enqueue') {
+          if (!task) return fail('task required');
+          let parsedTask: unknown;
+          try { parsedTask = JSON.parse(task); } catch { return fail('task must be valid JSON'); }
+          const pri = priority ?? 5;
+          const { id } = await a2aDb.enqueueTask(qName, pri, parsedTask);
+          return okBrief(`enqueued ${id} on ${qName} (priority ${pri})`);
+        }
+
+        if (action === 'dequeue') {
+          const row = await a2aDb.dequeueTask(qName, worker);
+          if (!row) return okBrief(`dequeue:${qName} (empty queue)`);
+          const taskJson = JSON.stringify(row.task);
+          return okBrief(`dequeue:${qName} id=${row.id} priority=${row.priority}\n${taskJson.slice(0, 1000)}`);
+        }
+
+        if (action === 'complete') {
+          if (!task_id) return fail('task_id required');
+          const res = await a2aDb.completeTask(task_id, taskResult ?? '');
+          return okBrief(res.found ? `task ${task_id} completed` : `task ${task_id} not found`);
+        }
+
+        if (action === 'fail') {
+          if (!task_id) return fail('task_id required');
+          const res = await a2aDb.failTask(task_id, taskError ?? 'unknown');
+          return okBrief(res.found ? `task ${task_id} failed` : `task ${task_id} not found`);
+        }
+
+        if (action === 'status') {
+          const s = await a2aDb.queueStatus(qName);
+          return okBrief(`queue:${qName}\npending: ${s.pending}\nin_progress: ${s.in_progress}\ncomplete: ${s.complete}\nfailed: ${s.failed}`);
+        }
+
+        if (action === 'pending') {
+          const rows = await a2aDb.pendingTasks(qName, 20);
+          if (rows.length === 0) return okBrief(`pending:${qName} (empty)`);
+          const body = rows
+            .map((r) => `${r.id} pri=${r.priority} ${r.enqueued_at.toISOString()} ${JSON.stringify(r.task).slice(0, 120)}`)
+            .join('\n');
+          return okBrief(`pending:${qName}: ${rows.length}\n${body}`);
+        }
+
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
       }
-
-      if (action === 'dequeue') {
-        // Take highest priority task (9 first, then 8, ...)
-        const result = await manager.exec(nodeId, `f=$(ls -r ${qDir}/*.task 2>/dev/null | head -1); [ -n "$f" ] && cat "$f" && rm -f "$f" || echo '(empty queue)'`);
-        return ok(nodeId, result.durationMs, result.stdout, `dequeue:${qName}`);
-      }
-
-      if (action === 'complete' && task_id) {
-        const entry = JSON.stringify({ id: task_id, status: 'complete', ts: Date.now(), result: taskResult ?? '' });
-        const escaped = entry.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${qDir}/done && echo '${escaped}' > ${qDir}/done/${task_id}.result`);
-        return okBrief(`task ${task_id} completed`);
-      }
-
-      if (action === 'fail' && task_id) {
-        const entry = JSON.stringify({ id: task_id, status: 'failed', ts: Date.now(), error: taskError ?? 'unknown' });
-        const escaped = entry.replace(/'/g, "'\\''");
-        await manager.exec(nodeId, `mkdir -p ${qDir}/failed && echo '${escaped}' > ${qDir}/failed/${task_id}.result`);
-        return okBrief(`task ${task_id} failed`);
-      }
-
-      if (action === 'status') {
-        const result = await manager.exec(nodeId, `echo "pending: $(ls ${qDir}/*.task 2>/dev/null | wc -l)"; echo "done: $(ls ${qDir}/done/*.result 2>/dev/null | wc -l)"; echo "failed: $(ls ${qDir}/failed/*.result 2>/dev/null | wc -l)"`);
-        return ok(nodeId, result.durationMs, result.stdout, `queue:${qName}`);
-      }
-
-      if (action === 'pending') {
-        const result = await manager.exec(nodeId, `cat ${qDir}/*.task 2>/dev/null | head -20 || echo '(empty)'`);
-        return ok(nodeId, result.durationMs, result.stdout, `pending:${qName}`);
-      }
-
-      return fail('invalid action');
     }
   );
 

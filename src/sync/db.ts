@@ -40,6 +40,12 @@ export class SyncDB {
     await runMigrations(this.pool);
   }
 
+  /** Expose the underlying pg.Pool for sibling modules (e.g. A2A DB).
+   *  Read-only handle — callers must not call .end() on it. */
+  getPool(): pg.Pool {
+    return this.pool;
+  }
+
   // One-shot data migration: claim this node's legacy unnamespaced
   // per-node rows (e.g. `cron/runs/foo.jsonl` updated_by_node=<me>) into
   // the namespaced form (`cron/<me>/runs/foo.jsonl`). Idempotent — rows

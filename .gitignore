@@ -4,6 +4,11 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Agent orchestration scratch — never commit
+.coalition/
+.gang/
+.claude/worktrees/
+
 # Personal config (contains IPs, SSH keys, credentials)
 cybersync.bat
 cybersync.vbs

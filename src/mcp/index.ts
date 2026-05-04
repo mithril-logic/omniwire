@@ -18,6 +18,7 @@ import { allNodes, getLocalNodeId } from '../protocol/config.js';
 import { DEFAULT_SYNC_CONFIG } from '../sync/types.js';
 import type { SyncConfig } from '../sync/types.js';
 import { startEventServer, eventBus } from './events.js';
+import { createA2aDb, type A2aDb } from './a2a-db.js';
 
 const args = process.argv.slice(2);
 const useStdio = args.includes('--stdio');
@@ -42,17 +43,29 @@ async function main(): Promise<void> {
   await manager.connectAll();
 
   const transfer = new TransferEngine(manager);
-  const server = createOmniWireServer(manager, transfer);
 
-  // Initialize CyberSync if not disabled
-  let syncDb: SyncDB | null = null;
+  // Initialize SyncDB unconditionally — A2A tables and migrations need it
+  // even when sync fanout is disabled (`--no-sync`). The pg.Pool is shared
+  // between the optional sync engine and the always-on A2A DB module.
+  const nodeId = getLocalNodeId();
+  const config: SyncConfig = { ...DEFAULT_SYNC_CONFIG, nodeId };
+  let syncDb: SyncDB;
+  let a2aDb: A2aDb;
+  try {
+    syncDb = new SyncDB(config);
+    await syncDb.init();
+    a2aDb = createA2aDb(syncDb.getPool());
+  } catch (err) {
+    // Fail fast — A2A is required infrastructure now; sync fanout is optional.
+    log(`A2A DB init failed: ${(err as Error).message}`, { error: (err as Error).message });
+    throw err;
+  }
+
+  const server = createOmniWireServer(manager, transfer, a2aDb);
+
+  // Sync-specific tooling stays gated on --no-sync.
   if (!noSync) {
     try {
-      const nodeId = getLocalNodeId();
-      const config: SyncConfig = { ...DEFAULT_SYNC_CONFIG, nodeId };
-      syncDb = new SyncDB(config);
-      await syncDb.init();
-
       const node = allNodes().find((n) => n.id === nodeId);
       const os = node?.os ?? 'linux';
       const manifests = getManifests(os);
@@ -61,7 +74,7 @@ async function main(): Promise<void> {
       registerSyncTools(server, syncDb, engine, manifests, nodeId, manager, transfer);
       log('CyberSync: 17 tools registered', { tools: 17, node: nodeId });
     } catch (err) {
-      log(`CyberSync init failed (continuing without sync): ${(err as Error).message}`, { error: (err as Error).message });
+      log(`CyberSync tools registration failed (continuing without sync): ${(err as Error).message}`, { error: (err as Error).message });
     }
   }
 
