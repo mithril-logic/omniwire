@@ -47,8 +47,18 @@ export class SyncWatcher {
 
     if (allGlobs.length === 0) return;
 
+    // Staging files created by the atomic-write path (posix-rename via a
+    // sibling `.cybersync-tmp[.NNN]` file) must be invisible to chokidar —
+    // otherwise the watcher observes the temp file, re-pushes it as a new
+    // sync_item, and re-triggers the distributed echo loop. Match both the
+    // bare suffix and any numeric suffix (e.g. `.cybersync-tmp.42731`).
+    const CYBERSYNC_TMP_RE = /\.cybersync-tmp(\.\d+)?$/;
+
     this.watcher = watch(allGlobs, {
-      ignored: allIgnored,
+      ignored: [
+        ...allIgnored,
+        (path: string) => CYBERSYNC_TMP_RE.test(path),
+      ],
       persistent: true,
       ignoreInitial: true,
       awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
