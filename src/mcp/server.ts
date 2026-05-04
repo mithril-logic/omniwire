@@ -3532,7 +3532,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       action: z.enum(['acquire', 'release', 'status', 'list']).describe('Action'),
       lock_name: z.string().optional().describe('Lock name (e.g., "deploy-prod", "db-migration")'),
       node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
-      owner: z.string().optional().describe('Owner/agent name (for acquire)'),
+      owner: z.string().optional().describe('Owner/agent name. Required for acquire AND release — release fails if owner doesn\'t match the current lock holder.'),
       ttl: z.number().optional().describe('Lock TTL in seconds (default: 300). Auto-releases after TTL.'),
     },
     async ({ action, lock_name, node, owner, ttl }) => {
@@ -3791,7 +3791,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
       topic: z.string().optional().describe('Board topic (e.g., "recon-findings", "vuln-analysis")'),
       content: z.string().optional().describe('Content to post'),
       author: z.string().optional().describe('Author agent ID'),
-      query: z.string().optional().describe('Search query (grep pattern) for search action'),
+      query: z.string().optional().describe('Full-text search query (Postgres FTS via plainto_tsquery; falls back to ILIKE if FTS yields nothing). Pass plain words.'),
       limit: z.number().optional().describe('Max entries (default: 20)'),
     },
     async ({ action, node, topic, content, author, query, limit }) => {
