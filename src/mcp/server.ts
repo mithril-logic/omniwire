@@ -3458,11 +3458,11 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 38: omniwire_a2a_message ---
   server.tool(
     'omniwire_a2a_message',
-    'Agent-to-agent messaging via shared message queues on mesh nodes. Agents can send/receive typed messages, enabling multi-agent coordination without direct coupling. Messages are stored on disk and survive process restarts.',
+    'Agent-to-agent messaging via shared message queues. Agents can send/receive typed messages, enabling multi-agent coordination without direct coupling. Backed by Postgres on tank — state is shared across all mesh nodes.',
     {
       action: z.enum(['send', 'receive', 'peek', 'list_channels', 'clear']).describe('Action'),
       channel: z.string().optional().describe('Message channel name (e.g., "recon-results", "scan-tasks")'),
-      node: z.string().optional().describe('Node hosting the queue (default: contabo)'),
+      node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
       message: z.string().optional().describe('Message content (for send). Can be JSON.'),
       sender: z.string().optional().describe('Sender agent name (for send)'),
       count: z.number().optional().describe('Number of messages to receive (default: 1). Messages are dequeued on receive.'),
@@ -3483,19 +3483,19 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
 
         if (action === 'receive') {
           if (!channel) return fail('channel required');
-          const n = count ?? 1;
+          const n = Math.min(count ?? 1, 500);
           const consumer = sender ?? 'unknown';
           const rows = await a2aDb.receiveMessages(channel, n, consumer);
           if (rows.length === 0) return okBrief(`${channel}: (empty queue)`);
           const body = rows
-            .map((r) => `${r.id} [${r.sender}] ${r.message.slice(0, 120)}`)
+            .map((r) => `${r.id} [${r.sender}] ${r.message}`)
             .join('\n');
           return okBrief(`${channel}: ${rows.length} message${rows.length === 1 ? '' : 's'} received\n${body}`);
         }
 
         if (action === 'peek') {
           if (!channel) return fail('channel required');
-          const n = count ?? 5;
+          const n = Math.min(count ?? 5, 500);
           const rows = await a2aDb.peekMessages(channel, n);
           if (rows.length === 0) return okBrief(`${channel}: (empty queue)`);
           const body = rows
@@ -3527,11 +3527,11 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 39: omniwire_semaphore ---
   server.tool(
     'omniwire_semaphore',
-    'Distributed locking / semaphore for multi-agent coordination. Prevents race conditions when multiple agents operate on the same resource. Uses atomic file-based locks on mesh nodes.',
+    'Distributed locking / semaphore for multi-agent coordination. Prevents race conditions when multiple agents operate on the same resource. Postgres-backed locks; shared across all mesh nodes.',
     {
       action: z.enum(['acquire', 'release', 'status', 'list']).describe('Action'),
       lock_name: z.string().optional().describe('Lock name (e.g., "deploy-prod", "db-migration")'),
-      node: z.string().optional().describe('Node hosting the lock (default: contabo)'),
+      node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
       owner: z.string().optional().describe('Owner/agent name (for acquire)'),
       ttl: z.number().optional().describe('Lock TTL in seconds (default: 300). Auto-releases after TTL.'),
     },
@@ -3587,11 +3587,11 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 40: omniwire_event ---
   server.tool(
     'omniwire_event',
-    'Publish/subscribe events for agent coordination. Agents can emit events and other agents can poll for them. Events are timestamped and stored in a log for audit. Supports the ACP/A2A event-driven pattern.',
+    'Publish/subscribe events for agent coordination. Agents can emit events and other agents can poll for them. Events are timestamped and persisted in shared Postgres for audit. Supports the ACP/A2A event-driven pattern.',
     {
       action: z.enum(['emit', 'poll', 'history', 'clear']).describe('Action'),
       topic: z.string().optional().describe('Event topic (e.g., "deploy.complete", "scan.found-vuln")'),
-      node: z.string().optional().describe('Node hosting events (default: contabo)'),
+      node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
       data: z.string().optional().describe('Event data/payload (for emit). Can be JSON.'),
       source: z.string().optional().describe('Source agent name (for emit)'),
       since: z.string().optional().describe('Only return events after this timestamp (epoch ms) for poll'),
@@ -3722,22 +3722,23 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 42: omniwire_agent_registry ---
   server.tool(
     'omniwire_agent_registry',
-    'Register/discover agents on the mesh. Agents announce their capabilities and other agents can discover them. Enables dynamic A2A routing and capability-based task delegation.',
+    'Register/discover agents on the mesh. Agents announce their capabilities and other agents can discover them. Enables dynamic A2A routing and capability-based task delegation. Registry is shared across all mesh nodes via Postgres.',
     {
       action: z.enum(['register', 'deregister', 'discover', 'list', 'heartbeat']).describe('Action'),
-      node: z.string().optional().describe('Node hosting registry (default: contabo)'),
+      node: z.string().optional().describe('Informational only — registry is shared in Postgres; this parameter has no effect on heartbeat/discover/list. For register, omit to auto-detect the local node.'),
       agent_id: z.string().optional().describe('Unique agent ID'),
       capabilities: z.array(z.string()).optional().describe('Agent capabilities (e.g., ["scan", "exploit", "report"])'),
       metadata: z.string().optional().describe('JSON metadata about the agent'),
       capability: z.string().optional().describe('Capability to search for (discover action)'),
     },
     async ({ action, node, agent_id, capabilities, metadata, capability }) => {
-      // The `node` parameter still names the agent's home node for registry rows.
-      const nodeId = node ?? getDbNode();
+      void node; // informational — registry state is shared in Postgres
 
       try {
         if (action === 'register') {
           if (!agent_id) return fail('agent_id required');
+          // Register the agent as living on the local node, not the Postgres host.
+          const nodeId = node ?? getLocalNodeId();
           await a2aDb.registerAgent(agent_id, capabilities ?? [], metadata ?? '{}', nodeId);
           return okBrief(`agent ${agent_id} registered (${(capabilities ?? []).join(', ') || 'no caps'}) on ${nodeId}`);
         }
@@ -3783,10 +3784,10 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 43: omniwire_blackboard ---
   server.tool(
     'omniwire_blackboard',
-    'Shared blackboard for multi-agent collaboration. Agents post findings, hypotheses, and decisions to topic-scoped boards. Other agents read and build on them. Classic AI blackboard architecture for agent swarms.',
+    'Shared blackboard for multi-agent collaboration. Agents post findings, hypotheses, and decisions to topic-scoped boards. Other agents read and build on them. Classic AI blackboard architecture for agent swarms. Boards are shared across all mesh nodes via Postgres.',
     {
       action: z.enum(['post', 'read', 'topics', 'clear', 'search']).describe('Action'),
-      node: z.string().optional(),
+      node: z.string().optional().describe('Informational only — A2A state is shared in Postgres; this parameter has no effect.'),
       topic: z.string().optional().describe('Board topic (e.g., "recon-findings", "vuln-analysis")'),
       content: z.string().optional().describe('Content to post'),
       author: z.string().optional().describe('Author agent ID'),
@@ -3850,13 +3851,13 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 44: omniwire_task_queue ---
   server.tool(
     'omniwire_task_queue',
-    'Distributed task queue for agent swarms. Producers enqueue tasks, consumer agents dequeue and process them. Supports priorities, deadlines, and result reporting. Core A2A work distribution primitive.',
+    'Distributed task queue for agent swarms. Producers enqueue tasks, consumer agents dequeue and process them. Supports priorities, deadlines, and result reporting. Core A2A work distribution primitive. Queue is shared across all mesh nodes via Postgres.',
     {
       action: z.enum(['enqueue', 'dequeue', 'complete', 'fail', 'status', 'pending']).describe('Action'),
-      node: z.string().optional(),
+      node: z.string().optional().describe('Informational only — task queue is shared in Postgres; this parameter has no effect.'),
       queue: z.string().optional().describe('Queue name (default: "default")'),
       task: z.string().optional().describe('Task payload (JSON) for enqueue'),
-      priority: z.number().optional().describe('Priority 0-9, higher = more urgent (default: 5)'),
+      priority: z.number().int().min(0).max(9).optional().describe('Priority 0-9, higher = more urgent (default: 5)'),
       task_id: z.string().optional().describe('Task ID for complete/fail'),
       result: z.string().optional().describe('Result data for complete'),
       error: z.string().optional().describe('Error message for fail'),
@@ -3880,7 +3881,7 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
           const row = await a2aDb.dequeueTask(qName, worker);
           if (!row) return okBrief(`dequeue:${qName} (empty queue)`);
           const taskJson = JSON.stringify(row.task);
-          return okBrief(`dequeue:${qName} id=${row.id} priority=${row.priority}\n${taskJson.slice(0, 1000)}`);
+          return okBrief(`dequeue:${qName} id=${row.id} priority=${row.priority}\n${taskJson}`);
         }
 
         if (action === 'complete') {
