@@ -141,6 +141,16 @@ const STATEMENTS: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_a2a_tasks_queue_pending
     ON a2a_tasks (queue, priority DESC, enqueued_at) WHERE status = 'pending'`,
   'CREATE INDEX IF NOT EXISTS idx_a2a_tasks_status ON a2a_tasks (status)',
+  // A2A: a2a_workflows — named DAG definitions, durable across nodes
+  `CREATE TABLE IF NOT EXISTS a2a_workflows (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL UNIQUE,
+    definition    JSONB NOT NULL,
+    source_node   TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  'CREATE INDEX IF NOT EXISTS idx_a2a_workflows_name ON a2a_workflows (name)',
 ];
 
 export async function runMigrations(pool: pg.Pool): Promise<void> {
