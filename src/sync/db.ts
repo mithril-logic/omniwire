@@ -108,6 +108,18 @@ export class SyncDB {
 
   // --- sync_items ---
 
+  // Upsert a sync_items row, returning both the row and a `mutated` flag
+  // indicating whether the DB state actually changed. The flag is the
+  // load-bearing signal for the Wave 1 loop-breaker: callers (engine.pushFile)
+  // must NOT fan out to remote peers when mutated=false, otherwise an incoming
+  // SFTP write triggers chokidar -> pushFile -> peer fan-out -> echo storm.
+  //
+  // Mutation detection: the ON CONFLICT clause carries
+  //   WHERE sync_items.content_hash != EXCLUDED.content_hash
+  // so a hash-match no-op causes the DO UPDATE to be filtered out and
+  // RETURNING yields zero rows. We treat that case (rows.length === 0) as
+  // mutated=false and SELECT the existing row for the return value. Any
+  // RETURNING row — whether the INSERT path or a real UPDATE — is mutated=true.
   async upsertItem(item: {
     tool: string;
     category: string;
@@ -118,7 +130,7 @@ export class SyncDB {
     metadata: Record<string, unknown>;
     updatedByNode: string;
     encrypted?: boolean;
-  }): Promise<SyncItem> {
+  }): Promise<{ item: SyncItem; mutated: boolean }> {
     const { rows } = await this.pool.query(
       `INSERT INTO sync_items (tool, category, rel_path, content_hash, content, content_size, metadata, updated_by_node, is_deleted, encrypted)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)
@@ -135,15 +147,22 @@ export class SyncDB {
        RETURNING *`,
       [item.tool, item.category, item.relPath, item.contentHash, item.content, item.contentSize, JSON.stringify(item.metadata), item.updatedByNode, item.encrypted ?? false]
     );
-    // If no rows returned, item already up-to-date — fetch existing
+    // If no rows returned, item already up-to-date — fetch existing and
+    // report mutated=false so the engine skips the remote fan-out.
     if (rows.length === 0) {
       const existing = await this.pool.query(
         'SELECT * FROM sync_items WHERE tool = $1 AND rel_path = $2',
         [item.tool, item.relPath]
       );
-      return this.mapSyncItem(existing.rows[0] as Record<string, unknown>);
+      return {
+        item: this.mapSyncItem(existing.rows[0] as Record<string, unknown>),
+        mutated: false,
+      };
     }
-    return this.mapSyncItem(rows[0] as unknown as Record<string, unknown>);
+    return {
+      item: this.mapSyncItem(rows[0] as unknown as Record<string, unknown>),
+      mutated: true,
+    };
   }
 
   async markDeleted(tool: string, relPath: string, nodeId: string): Promise<void> {
