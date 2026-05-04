@@ -18,21 +18,14 @@ export function getManifests(os: 'windows' | 'linux' | 'darwin'): readonly ToolM
   const home = getHomeForOs(os);
 
   return [
+    // claude-code: syncGlobs intentionally empty.
+    // yadm (https://yadm.io) tracks ~/.claude/ as a bare git repo over $HOME.
+    // OmniWire MUST NOT write into yadm-tracked paths — concurrent edits race
+    // the same files and were the architectural class of bug behind the
+    // 2026-04-23 openclaw.json clobber loop. Knowledge ingest below remains
+    // read-only-into-Postgres and does not write any local files.
     manifest('claude-code', os,
-      [
-        'agents/**/*.md',
-        'skills/**/*',
-        'commands/**/*.md',
-        'rules/**/*.md',
-        'hooks/**/*',
-        'plugins/**/*.json',
-        'memory/**/*',
-        'settings.json',
-        'settings.local.json',
-        'keybindings.json',
-        'CLAUDE.md',
-        'scripts/**/*',
-      ],
+      [],
       [
         '.credentials.json',
         'history.jsonl',
@@ -50,7 +43,8 @@ export function getManifests(os: 'windows' | 'linux' | 'darwin'): readonly ToolM
         'plans/**',
         'projects/**',
       ],
-      `${home}/.claude/memory.db`
+      `${home}/.claude/memory.db`,
+      ['agents', 'skills', 'memory']
     ),
     manifest('opencode', os,
       [
@@ -87,20 +81,24 @@ export function getManifests(os: 'windows' | 'linux' | 'darwin'): readonly ToolM
       undefined,
       ['agents', 'skills', 'memory', 'workspace', 'identity', 'cron']
     ),
+    // codex: syncGlobs intentionally empty.
+    // yadm (https://yadm.io) tracks ~/.codex/ as a bare git repo over $HOME.
+    // OmniWire MUST NOT write into yadm-tracked paths — concurrent edits race
+    // the same files and were the architectural class of bug behind the
+    // 2026-04-23 openclaw.json clobber loop. Knowledge ingest (if added later)
+    // remains read-only-into-Postgres and does not write any local files.
     manifest('codex', os,
-      [
-        'config.toml',
-        'AGENTS.md',
-        'skills/**/*',
-        'memories/**/*',
-      ],
+      [],
       []
     ),
+    // gemini: syncGlobs intentionally empty.
+    // yadm (https://yadm.io) tracks ~/.gemini/ (or will) as a bare git repo
+    // over $HOME. OmniWire MUST NOT write into yadm-tracked paths — concurrent
+    // edits race the same files and were the architectural class of bug behind
+    // the 2026-04-23 openclaw.json clobber loop. Knowledge ingest (if added
+    // later) remains read-only-into-Postgres and does not write any local files.
     manifest('gemini', os,
-      [
-        'settings.json',
-        'projects.json',
-      ],
+      [],
       []
     ),
     manifest('paperclip', os,
