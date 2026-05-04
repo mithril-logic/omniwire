@@ -3645,77 +3645,99 @@ echo "port-knock configured: ${ports.join(' -> ')} -> port ${target}"`;
   // --- Tool 41: omniwire_workflow ---
   server.tool(
     'omniwire_workflow',
-    'Define and execute a named workflow (DAG of steps) that can be reused. Workflows are stored on disk and can be triggered by any agent. Supports conditional steps, fan-out/fan-in, and cross-node orchestration.',
+    'Define and execute a named workflow (DAG of steps) that can be reused. Persisted in Postgres (shared across all mesh nodes). Workflow definitions are durable; per-step execution still routes through the mesh. Supports conditional steps, fan-out/fan-in, and cross-node orchestration.',
     {
-      action: z.enum(['define', 'run', 'list', 'get', 'delete']).describe('Action'),
+      action: z.enum(['define', 'run', 'list', 'get', 'dump', 'clear']).describe('Action'),
       name: z.string().optional().describe('Workflow name'),
-      node: z.string().optional().describe('Node to store/run workflow (default: contabo)'),
+      node: z.string().optional().describe('Informational only — workflow definitions are shared in Postgres; this parameter has no effect on define/get/list/dump/clear. For run, defaults the per-step execution node when a step omits its own node.'),
       definition: z.string().optional().describe('JSON workflow definition for define action. Format: {steps: [{node, command, label, depends_on?, store_as?}]}'),
       format: z.enum(['text', 'json']).optional(),
     },
     async ({ action, name, node, definition, format }) => {
-      const nodeId = node ?? getDbNode();
-      const wfDir = '/tmp/.omniwire-workflows';
       const useJson = format === 'json';
 
-      if (action === 'define') {
-        if (!name || !definition) return fail('name and definition required');
-        const escaped = definition.replace(/'/g, "'\\''");
-        const result = await manager.exec(nodeId, `mkdir -p ${wfDir} && echo '${escaped}' > ${wfDir}/${name}.json`);
-        return result.code === 0 ? okBrief(`workflow ${name} defined`) : fail(result.stderr);
-      }
-
-      if (action === 'run') {
-        if (!name) return fail('name required');
-        const readResult = await manager.exec(nodeId, `cat ${wfDir}/${name}.json 2>/dev/null`);
-        if (readResult.code !== 0) return fail(`workflow ${name} not found`);
-
-        let wf: { steps: Array<{ node?: string; command: string; label?: string; depends_on?: number[]; store_as?: string }> };
-        try { wf = JSON.parse(readResult.stdout); } catch { return fail('invalid workflow definition'); }
-
-        const stepResults: string[] = [];
-        const stepOutputs: string[] = [];
-
-        for (let i = 0; i < wf.steps.length; i++) {
-          const step = wf.steps[i];
-          const stepNode = step.node ?? nodeId;
-          let cmd = step.command
-            .replace(/\{\{step(\d+)\}\}/g, (_, n) => stepOutputs[parseInt(n)] ?? '')
-            .replace(/\{\{(\w+)\}\}/g, (_, key) => resultStore.get(key) ?? `{{${key}}}`);
-
-          const result = await manager.exec(stepNode, cmd);
-          stepOutputs[i] = result.stdout.trim();
-          if (step.store_as && result.code === 0) resultStore.set(step.store_as, result.stdout.trim());
-
-          const status = result.code === 0 ? 'ok' : `exit ${result.code}`;
-          stepResults.push(useJson
-            ? JSON.stringify({ step: i, node: stepNode, label: step.label, ok: result.code === 0, code: result.code, ms: result.durationMs, stdout: result.stdout.slice(0, 1000) })
-            : `[${i}] ${stepNode} > ${step.label ?? `step ${i}`}  ${t(result.durationMs)}  ${status}\n${result.stdout.split('\n').slice(0, 5).join('\n')}`);
-
-          if (result.code !== 0) break;
+      try {
+        if (action === 'define') {
+          if (!name || !definition) return fail('name and definition required');
+          let parsed: unknown;
+          try { parsed = JSON.parse(definition); } catch { return fail('definition must be valid JSON'); }
+          const result = await a2aDb.defineWorkflow(name, parsed, getLocalNodeId());
+          return okBrief(`workflow ${name} ${result.created ? 'created' : 'updated'} (id ${result.id})`);
         }
 
-        return useJson ? okBrief(`[${stepResults.join(',')}]`) : okBrief(trim(stepResults.join('\n\n')));
-      }
+        if (action === 'run') {
+          if (!name) return fail('name required');
+          const wf = await a2aDb.getWorkflow(name);
+          if (!wf) return fail(`workflow not found: ${name}`);
 
-      if (action === 'list') {
-        const result = await manager.exec(nodeId, `ls -1 ${wfDir}/*.json 2>/dev/null | xargs -I{} basename {} .json || echo '(no workflows)'`);
-        return ok(nodeId, result.durationMs, result.stdout, 'workflows');
-      }
+          const def = wf.definition as { steps?: Array<{ node?: string; command: string; label?: string; depends_on?: number[]; store_as?: string }> } | null;
+          if (!def || !Array.isArray(def.steps)) return fail('invalid workflow definition: missing steps[]');
 
-      if (action === 'get') {
-        if (!name) return fail('name required');
-        const result = await manager.exec(nodeId, `cat ${wfDir}/${name}.json 2>/dev/null || echo 'not found'`);
-        return ok(nodeId, result.durationMs, result.stdout, `workflow ${name}`);
-      }
+          // Default execution node when a step omits its own: caller-supplied `node` param,
+          // else the local node where this MCP server runs.
+          const fallbackNode = node ?? getLocalNodeId();
+          const stepResults: string[] = [];
+          const stepOutputs: string[] = [];
 
-      if (action === 'delete') {
-        if (!name) return fail('name required');
-        await manager.exec(nodeId, `rm -f ${wfDir}/${name}.json`);
-        return okBrief(`workflow ${name} deleted`);
-      }
+          for (let i = 0; i < def.steps.length; i++) {
+            const step = def.steps[i];
+            const stepNode = step.node ?? fallbackNode;
+            const cmd = step.command
+              .replace(/\{\{step(\d+)\}\}/g, (_, n) => stepOutputs[parseInt(n)] ?? '')
+              .replace(/\{\{(\w+)\}\}/g, (_, key) => resultStore.get(key) ?? `{{${key}}}`);
 
-      return fail('invalid action');
+            const result = await manager.exec(stepNode, cmd);
+            stepOutputs[i] = result.stdout.trim();
+            if (step.store_as && result.code === 0) resultStore.set(step.store_as, result.stdout.trim());
+
+            const status = result.code === 0 ? 'ok' : `exit ${result.code}`;
+            stepResults.push(useJson
+              ? JSON.stringify({ step: i, node: stepNode, label: step.label, ok: result.code === 0, code: result.code, ms: result.durationMs, stdout: result.stdout.slice(0, 1000) })
+              : `[${i}] ${stepNode} > ${step.label ?? `step ${i}`}  ${t(result.durationMs)}  ${status}\n${result.stdout.split('\n').slice(0, 5).join('\n')}`);
+
+            if (result.code !== 0) break;
+          }
+
+          return useJson ? okBrief(`[${stepResults.join(',')}]`) : okBrief(trim(stepResults.join('\n\n')));
+        }
+
+        if (action === 'get') {
+          if (!name) return fail('name required');
+          const wf = await a2aDb.getWorkflow(name);
+          if (!wf) return fail(`workflow not found: ${name}`);
+          return okBrief(JSON.stringify(wf.definition, null, 2));
+        }
+
+        if (action === 'list') {
+          const rows = await a2aDb.listWorkflows();
+          if (rows.length === 0) return okBrief('(no workflows)');
+          return okBrief(rows.map((r) => `${r.name}\t${r.updated_at.toISOString()}`).join('\n'));
+        }
+
+        if (action === 'dump') {
+          if (!name) return fail('name required');
+          const wf = await a2aDb.dumpWorkflow(name);
+          if (!wf) return fail(`workflow not found: ${name}`);
+          return okBrief(JSON.stringify({
+            id: wf.id,
+            name: wf.name,
+            definition: wf.definition,
+            source_node: wf.source_node,
+            created_at: wf.created_at.toISOString(),
+            updated_at: wf.updated_at.toISOString(),
+          }, null, 2));
+        }
+
+        if (action === 'clear') {
+          if (!name) return fail('name required');
+          const result = await a2aDb.clearWorkflow(name);
+          return okBrief(result.removed ? `workflow ${name} cleared` : `workflow ${name} not found`);
+        }
+
+        return fail('invalid action');
+      } catch (err) {
+        return fail(`A2A unavailable: ${(err as Error).message}`);
+      }
     }
   );
 
