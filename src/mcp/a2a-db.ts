@@ -58,6 +58,15 @@ export interface LockRow {
   expires_at: Date;
 }
 
+export interface WorkflowRow {
+  id: string;
+  name: string;
+  definition: unknown;
+  source_node: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
 // ---- Module API ----
 
 export interface A2aDb {
@@ -101,6 +110,13 @@ export interface A2aDb {
   failTask(task_id: string, error: string): Promise<{ found: boolean }>;
   queueStatus(queue: string): Promise<{ pending: number; in_progress: number; complete: number; failed: number }>;
   pendingTasks(queue: string, limit: number): Promise<TaskRow[]>;
+
+  // workflow registry — durable DAG definitions; per-step execution stays in handler
+  defineWorkflow(name: string, definition: unknown, sourceNode: string): Promise<{ id: string; created: boolean }>;
+  getWorkflow(name: string): Promise<WorkflowRow | null>;
+  listWorkflows(): Promise<Array<{ name: string; updated_at: Date }>>;
+  dumpWorkflow(name: string): Promise<WorkflowRow | null>; // alias for getWorkflow, full row
+  clearWorkflow(name: string): Promise<{ removed: boolean }>;
 }
 
 // ---- Constants ----
@@ -191,6 +207,17 @@ function rowToLock(r: Record<string, unknown>): LockRow {
     owner: String(r.owner),
     acquired_at: r.acquired_at as Date,
     expires_at: r.expires_at as Date,
+  };
+}
+
+function rowToWorkflow(r: Record<string, unknown>): WorkflowRow {
+  return {
+    id: String(r.id),
+    name: String(r.name),
+    definition: r.definition,
+    source_node: String(r.source_node),
+    created_at: r.created_at as Date,
+    updated_at: r.updated_at as Date,
   };
 }
 
@@ -605,6 +632,57 @@ export function createA2aDb(pool: pg.Pool): A2aDb {
         [queue, lim]
       );
       return res.rows.map(rowToTask);
+    },
+
+    // ============================================================
+    // a2a_workflows (durable definitions)
+    // ============================================================
+    async defineWorkflow(name, definition, sourceNode) {
+      const res = await pool.query<{ id: string; inserted: boolean }>(
+        `INSERT INTO a2a_workflows (name, definition, source_node)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (name) DO UPDATE
+           SET definition = EXCLUDED.definition,
+               source_node = EXCLUDED.source_node,
+               updated_at = now()
+         RETURNING id, (xmax = 0) AS inserted`,
+        [name, JSON.stringify(definition), sourceNode]
+      );
+      const row = res.rows[0]!;
+      return { id: row.id, created: row.inserted };
+    },
+
+    async getWorkflow(name) {
+      const res = await pool.query(
+        `SELECT * FROM a2a_workflows WHERE name = $1`,
+        [name]
+      );
+      if (!res.rowCount || !res.rows[0]) return null;
+      return rowToWorkflow(res.rows[0]);
+    },
+
+    async listWorkflows() {
+      const res = await pool.query<{ name: string; updated_at: Date }>(
+        `SELECT name, updated_at FROM a2a_workflows ORDER BY updated_at DESC`
+      );
+      return res.rows.map((r) => ({ name: r.name, updated_at: r.updated_at }));
+    },
+
+    async dumpWorkflow(name) {
+      const res = await pool.query(
+        `SELECT * FROM a2a_workflows WHERE name = $1`,
+        [name]
+      );
+      if (!res.rowCount || !res.rows[0]) return null;
+      return rowToWorkflow(res.rows[0]);
+    },
+
+    async clearWorkflow(name) {
+      const res = await pool.query(
+        `DELETE FROM a2a_workflows WHERE name = $1`,
+        [name]
+      );
+      return { removed: (res.rowCount ?? 0) > 0 };
     },
   };
 }
