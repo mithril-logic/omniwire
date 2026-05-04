@@ -1,0 +1,429 @@
+// OmniWire incident forensics + remediation map
+//
+// Diagnostic memorial for the 2026-04-{10..24} openclaw.json clobber loop +
+// orphan-mcp port-3200 collision, and the 2026-05-04 A2A Postgres rewrite that
+// landed on gang/a2a-fix-merged.
+//
+// Source of truth (cross-reference verbatim):
+//   ~/claude/omniwire/SESSION-STATE.md  (full incident timeline + fix list)
+//   ~/claude/omniwire/.coalition/2026-04-23-openclaw-clobber-root-cause.md
+//   ~/claude/omniwire/.coalition/2026-04-23-openclaw-clobber-3-questions.md
+//   ~/claude/omniwire/.coalition/2026-04-24-fanout-loop-fix.md
+//   ~/claude/omniwire/.coalition/2026-04-24-zombie-prevention.md
+//   ~/claude/omniwire/.coalition/runs/20260503T204056Z-2026-05-03-a2a-plan-QTELf6/
+//
+// Code anchors (paths relative to repo root):
+//   src/sync/db.ts:111-147        upsertItem (Wave 1 mutation flag, NOT DEPLOYED here)
+//   src/sync/engine.ts:37-74      pushFile -> pushToRemoteNodes (gate on mutated, NOT DEPLOYED)
+//   src/sync/engine.ts:290-329    pushToRemoteNodes (SFTP fan-out)
+//   src/sync/manifest.ts:76       openclaw.json removal (LIVE on master, still present here)
+//   src/sync/index.ts:113-125     watcher handler — pushFile on every chokidar event
+//   src/sync/watcher.ts:50-56     awaitWriteFinish 200ms, fires on incoming SFTP
+//   src/mcp/server.ts:3788        former cb('blackboard', ...) shell-exec (LIVE-removed)
+//   src/mcp/a2a-db.ts             new direct-pg A2A module (landed c7b4dba)
+//   src/sync/schema.ts            +73 lines, 6 A2A tables (landed 0b3a899)
+//
+// Render: dot -Tpng docs/arch/incident-forensics.dot -o docs/arch/incident-forensics.png
+//         dot -Tsvg docs/arch/incident-forensics.dot -o docs/arch/incident-forensics.svg
+
+digraph incident_forensics {
+  rankdir=TB;
+  compound=true;
+  newrank=true;
+  fontname="Helvetica";
+  fontsize=11;
+  labelloc="t";
+  labeljust="c";
+  label="OmniWire incident forensics + remediation map";
+
+  node [fontname="Helvetica", fontsize=10];
+  edge [fontname="Helvetica", fontsize=9];
+
+  // ========================================================================
+  // EDGE-STYLE LEGEND
+  //   solid red   "causes"      — causal chain
+  //   solid green "fixed by"    — applied remediation
+  //   dashed orange "deferred"  — designed-but-not-applied
+  //   solid black                — data flow / structural
+  // ========================================================================
+  subgraph cluster_legend {
+    label=<<b>legend</b>>;
+    style="rounded,filled";
+    fillcolor="#fdfdfd";
+    color="#aaa";
+    rank=sink;
+
+    legend_a [shape=plaintext, label="cause"];
+    legend_b [shape=plaintext, label="effect"];
+    legend_c [shape=plaintext, label="fix-source"];
+    legend_d [shape=plaintext, label="bug"];
+    legend_e [shape=plaintext, label="planned fix"];
+    legend_f [shape=plaintext, label="bug (deferred)"];
+    legend_g [shape=plaintext, label="upstream"];
+    legend_h [shape=plaintext, label="downstream"];
+
+    legend_a -> legend_b [color="#c00", label="causes", fontcolor="#c00"];
+    legend_c -> legend_d [color="#0a0", label="fixed by", fontcolor="#0a0"];
+    legend_e -> legend_f [color="#e88300", style=dashed, label="deferred", fontcolor="#e88300"];
+    legend_g -> legend_h [color="#222", label="data flow"];
+  }
+
+  // ========================================================================
+  // TIMELINE — chronological, left-to-right
+  // ========================================================================
+  subgraph cluster_timeline {
+    label=<<b>incident timeline (UTC unless EDT noted)</b>>;
+    style="rounded,filled";
+    fillcolor="#fff7e6";
+    color="#c98a1f";
+    fontsize=12;
+    rankdir=LR;
+
+    node [shape=box, style="filled,rounded", fillcolor="#ffe9b8", color="#7a4f00", fontsize=9];
+
+    t_2026_04_10 [label="2026-04-10 15:57\nfirst clobber artifact\n(675 B partial,\nopenclaw-gateway\nEACCES /Users)"];
+    t_2026_04_17 [label="2026-04-17\nssh+disown launch\nPID 1464291 sync\nPID 1464657 mcp-sse\n(setsid → orphans)"];
+    t_2026_04_18 [label="2026-04-18 23:39 EDT\nsystemd user units\nenabled on rei\norphan still holds :3200\nmcp.service restart loop"];
+    t_2026_04_20 [label="2026-04-20 06:47 EDT\nfirst 0-byte clobbers\non rei"];
+    t_2026_04_23a [label="2026-04-23 01:04\nDB row updated\ncontent_hash=e3b0c44…\n(empty hash)\nupdated_by_node=rei-pc"];
+    t_2026_04_23b [label="2026-04-23 17:55 EDT\nall 3 sync daemons\nstopped\n(macbook launchd,\nwsl+rei systemd)"];
+    t_2026_04_23c [label="2026-04-23 18:01 EDT\nrei openclaw.json\nrestored from\nApr 7 .bak (19,519 B)\nhash f9bddfb8…"];
+    t_2026_04_24 [label="2026-04-24\nWave 1 + flock +\nStartLimit fixes\nbuilt locally\nNOT DEPLOYED"];
+    t_2026_05_04 [label="2026-05-04\nA2A Postgres rewrite\nlanded on\ngang/a2a-fix-merged\n(c7b4dba)"];
+
+    t_2026_04_10 -> t_2026_04_17 -> t_2026_04_18 -> t_2026_04_20 -> t_2026_04_23a -> t_2026_04_23b -> t_2026_04_23c -> t_2026_04_24 -> t_2026_05_04 [color="#7a4f00", arrowhead=vee];
+  }
+
+  // ========================================================================
+  // BUG A — distributed SFTP fanout feedback loop
+  // ========================================================================
+  subgraph cluster_bug_a_fanout {
+    label=<<b>Bug A — distributed SFTP fanout feedback loop</b><br/>
+           <font point-size="9">openclaw.json clobbered to 0 B ~2×/sec across all mesh nodes</font>>;
+    style="rounded,filled";
+    fillcolor="#ffecec";
+    color="#c00";
+    fontsize=12;
+
+    a_node_x_write [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="file modified on node X\n(any source — initial trigger,\npath-adapt drift, or echo)"
+    ];
+    a_chokidar [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="chokidar 'change' event\nawaitWriteFinish 200ms\nfires on incoming SFTP too\nsrc/sync/watcher.ts:50-56"
+    ];
+    a_handler [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="watcher handler\nengine.pushFile(...)\nNO skipRemotePush\nsrc/sync/index.ts:113-125"
+    ];
+    a_pushfile [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>engine.pushFile|src/sync/engine.ts:37-74\lreadFile + hashBuffer\lupsertItem (returns SyncItem)\lpushToRemoteNodes UNCONDITIONAL\l(no mutation flag in caller)\l}"
+    ];
+    a_upsert [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>db.upsertItem|src/sync/db.ts:128-145\lON CONFLICT … WHERE\l content_hash != EXCLUDED.content_hash\lhash-match → no-op\lreturns existing row\lcaller cannot tell\lmutation from no-op\l}"
+    ];
+    a_pushremote [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>pushToRemoteNodes|src/sync/engine.ts:290-329\lPromise.allSettled\lover online peers\lSFTP transfer.writeFile\ladaptPathsForNode if JSON\l}"
+    ];
+    a_peers [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="N peers receive SFTP write\ntheir chokidar fires\n→ back to 'pushFile'\n=== INFINITE ECHO LOOP ==="
+    ];
+
+    a_node_x_write -> a_chokidar [color="#222"];
+    a_chokidar    -> a_handler   [color="#222"];
+    a_handler     -> a_pushfile  [color="#222"];
+    a_pushfile    -> a_upsert    [color="#222", label="reads/writes"];
+    a_pushfile    -> a_pushremote[color="#c00", label="causes\n(no gate)", fontcolor="#c00"];
+    a_pushremote  -> a_peers     [color="#c00", label="causes", fontcolor="#c00"];
+    a_peers       -> a_chokidar  [color="#c00", label="causes (echo)", fontcolor="#c00", constraint=false];
+  }
+
+  // ----- Bug A fixes cluster -----
+  subgraph cluster_bug_a_fixes {
+    label=<<b>Bug A remediation (Wave 1 / 2 / 3)</b>>;
+    style="rounded,filled";
+    fillcolor="#eaffea";
+    color="#0a0";
+    fontsize=11;
+
+    fix_a_wave1 [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>Wave 1 — loop-breaker (BUILT, NOT DEPLOYED)|upsertItem returns item + mutated flag\lpushFile gates pushToRemoteNodes on mutated=true\lhash-match no-op no longer fans out\lsrc/sync/db.ts + src/sync/engine.ts\l}"
+    ];
+    fix_a_wave2 [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>Wave 2 — boundary-anchored canonicalize-on-push (DEFERRED)|apply at every hash site\lengine.ts:39, 194, 268\l+ DB migration before rollout\lDarwin + Windows path coverage\lpre-req before any other heterogeneous JSON\l}"
+    ];
+    fix_a_wave3 [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>Wave 3 — atomic writes (DEFERRED)|posix-rename@openssh.com\lper-node capability probe\ltransfer.writeFile + base64 fallback\lpullPending local writeFile\lprevents 0-byte poison pills\lunlink-then-rename FORBIDDEN (phantom tombstones)\l}"
+    ];
+    fix_a_arch [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>architectural decision (LIVE on master)|openclaw.json removed from manifest\lsrc/sync/manifest.ts:76\lcrypto.ts SENSITIVE_GLOBS pruned\lEach node maintains its own openclaw.json\l(also: cb('blackboard',...) removed at server.ts:3788)\l}"
+    ];
+    fix_a_quarantine [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>empty-JSON quarantine (DEFERRED)|pushFile refuses to push 0 B\lor JSON.parse fails on .json/.jsonc\lblocks original-trigger class\lindependent of atomic-writes\l}"
+    ];
+
+    fix_a_wave1 -> a_pushremote [color="#0a0", label="fixed by\n(gate)", fontcolor="#0a0", lhead=cluster_bug_a_fanout, ltail=cluster_bug_a_fixes, constraint=false];
+    fix_a_arch  -> a_node_x_write [color="#0a0", label="fixed by\n(removed from\nmanifest)", fontcolor="#0a0", constraint=false];
+    fix_a_wave2 -> a_pushremote [color="#e88300", style=dashed, label="deferred", fontcolor="#e88300", constraint=false];
+    fix_a_wave3 -> a_pushremote [color="#e88300", style=dashed, label="deferred", fontcolor="#e88300", constraint=false];
+    fix_a_quarantine -> a_pushfile [color="#e88300", style=dashed, label="deferred", fontcolor="#e88300", constraint=false];
+  }
+
+  // ========================================================================
+  // BUG B — orphan-mcp port collision + missing circuit breaker
+  // ========================================================================
+  subgraph cluster_bug_b_orphan {
+    label=<<b>Bug B — orphan-mcp port 3200 collision</b><br/>
+           <font point-size="9">19,384 systemd restart attempts on rei</font>>;
+    style="rounded,filled";
+    fillcolor="#ffecec";
+    color="#c00";
+    fontsize=12;
+
+    b_apr17 [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>Apr 17 ssh+disown launch|setsid nohup node dist/sync/index.js …\lsetsid nohup node dist/mcp/index.js --sse-port=3200 …\ldisown\l→ outside any supervisor\lparent ppid: still-alive bash -c shell\l}"
+    ];
+    b_pids [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>orphan PIDs|1464291 sync (--node rei-pc)\l1464657 mcp-sse :3200\lboth ETIME 6d+ at investigation\lparent kill did NOT cascade (setsid)\l}"
+    ];
+    b_apr18 [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>Apr 18 23:39 EDT systemd|user units enabled\l~/.config/systemd/user/omniwire-mcp.service\lExecStart binds 0.0.0.0:3200\l→ EADDRINUSE every ~10s\l}"
+    ];
+    b_unit_old [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>OLD unit config (no circuit breaker)|Restart=on-failure\lRestartSec=10\lNO StartLimitBurst\lNO StartLimitIntervalSec\l→ NRestarts=19384\l}"
+    ];
+    b_double_sync [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="duplicate sync on rei\nboth use --node rei-pc\nfeeds Bug A 2× from rei\n(systemd PID 2052723\n+ orphan 1464291)"
+    ];
+
+    b_apr17 -> b_pids [color="#c00", label="causes", fontcolor="#c00"];
+    b_pids  -> b_apr18 [color="#c00", label="causes\n(:3200 held)", fontcolor="#c00"];
+    b_apr18 -> b_unit_old [color="#222"];
+    b_unit_old -> b_pids [color="#c00", label="amplifies", fontcolor="#c00", constraint=false];
+    b_pids -> b_double_sync [color="#c00", label="causes", fontcolor="#c00"];
+    b_double_sync -> a_pushfile [color="#c00", label="causes\n2× fanout", fontcolor="#c00", lhead=cluster_bug_a_fanout, constraint=false];
+  }
+
+  // ----- Bug B fixes cluster -----
+  subgraph cluster_bug_b_fixes {
+    label=<<b>Bug B remediation (BUILT, NOT DEPLOYED on wsl/rei)</b>>;
+    style="rounded,filled";
+    fillcolor="#eaffea";
+    color="#0a0";
+    fontsize=11;
+
+    fix_b_marker [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>marker arg|--omniwire-daemon=mcp-sse\l--omniwire-daemon=sync\lparse-and-ignore in code\lpgrep distinguishes managed vs orphan\l}"
+    ];
+    fix_b_flock [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>singleton lockfile (daemon-side)|fs.openSync(path, 'wx')\l~/.omniwire/sync.lock\l~/.omniwire/mcp-sse.lock\lforeign-hostname + stale-PID detection\lOMNIWIRE_*_LOCK env override\lexit code 3 on contention\lreleased on SIGINT/SIGTERM + process.on('exit')\l}"
+    ];
+    fix_b_startlimit [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>systemd circuit breaker|StartLimitBurst=5\lStartLimitIntervalSec=60\lin [Unit] section\ldaemon-reload + analyze verify\l(wsl + rei)\l}"
+    ];
+    fix_b_isstdio [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>SSE-mode gating|isSseMode = !useStdio &&\l (hasSsePort || hasRestPort || hasEventPort)\lstdio MCP never touches lockfile\lsrc/mcp/index.ts\l}"
+    ];
+
+    fix_b_marker     -> b_pids        [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    fix_b_flock      -> b_pids        [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    fix_b_flock      -> b_double_sync [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    fix_b_startlimit -> b_unit_old    [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    fix_b_isstdio    -> b_pids        [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+  }
+
+  // ========================================================================
+  // BUG C (deferred) — path adaptation asymmetry
+  // ========================================================================
+  subgraph cluster_bug_c_paths {
+    label=<<b>Bug C — path adaptation asymmetry (DEFERRED)</b><br/>
+           <font point-size="9">latent risk for any cross-node JSON with per-node paths</font>>;
+    style="rounded,dashed";
+    fillcolor="#fff7e6";
+    color="#e88300";
+    fontsize=11;
+
+    c_canon [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>canonical homes|src/sync/paths.ts:23-25\l/root  (canonical Linux)\lC:/Users/Admin (canonical Win)\ladaptPathsForNode rewrites only canonical strings\l}"
+    ];
+    c_rei [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="rei runs uid=1000 as /home/admin\nNON-canonical home\npushed non-canonical paths to DB"
+    ];
+    c_darwin [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="toDarwinPath does NOT handle\nDarwin → canonical direction\nat all"
+    ];
+    c_macbook [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="macbook pulled and got\nLinux paths verbatim on disk\n(/home/admin/.openclaw/workspace-*)\nstill present after recovery"
+    ];
+    c_arch [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>mitigation (LIVE)|openclaw.json removed from manifest\l(src/sync/manifest.ts:76)\lonly Wave-1-style mitigation deployed for now\lWave 2 needed before any other\lheterogeneous JSON can ride sync\l}"
+    ];
+
+    c_canon -> c_rei [color="#222"];
+    c_rei   -> c_darwin [color="#c00", label="exposes", fontcolor="#c00"];
+    c_darwin -> c_macbook [color="#c00", label="causes", fontcolor="#c00"];
+    c_arch   -> c_macbook [color="#0a0", label="contains\n(removes\ntrigger)", fontcolor="#0a0", constraint=false];
+  }
+
+  // ========================================================================
+  // A2A — pre-fix (BROKEN) architecture
+  // ========================================================================
+  subgraph cluster_a2a_prefix {
+    label=<<b>A2A pre-fix architecture (BROKEN)</b><br/>
+           <font point-size="9">cross-node messaging unreachable by design</font>>;
+    style="rounded,filled";
+    fillcolor="#ffecec";
+    color="#c00";
+    fontsize=12;
+
+    pre_mcp_sub [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="MCP subprocess (per node, per session)\nspawned by Claude Code / Codex / Pi"
+    ];
+    pre_tmp [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>local /tmp substrate|/tmp/.omniwire-a2a\l/tmp/.omniwire-blackboard\letc.\lNOT shared across nodes\lephemeral, per-process\l}"
+    ];
+    pre_cb [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>cb blackboard call (legacy)|src/mcp/server.ts:3788 (REMOVED)\lpsql via shell-exec\lstderr swallow + circuit breaker\lall errors silently dropped\lknowledge table: ZERO blackboard rows\lafter months of use\l}"
+    ];
+    pre_void [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="THE VOID\n208 invocations across 11 sessions\nall delivered into nothing\ncross-node A2A unreachable"
+    ];
+
+    pre_mcp_sub -> pre_tmp [color="#222", label="writes"];
+    pre_mcp_sub -> pre_cb  [color="#222", label="writes"];
+    pre_tmp -> pre_void [color="#c00", label="causes\n(no shared FS)", fontcolor="#c00"];
+    pre_cb  -> pre_void [color="#c00", label="causes\n(silent fail)", fontcolor="#c00"];
+  }
+
+  // ========================================================================
+  // A2A — post-fix architecture (LIVE on this branch)
+  // ========================================================================
+  subgraph cluster_a2a_rewrite {
+    label=<<b>A2A post-fix (LIVE on gang/a2a-fix-merged)</b><br/>
+           <font point-size="9">commits 0b3a899 + 9eb5f2d + c7b4dba + 426edfc</font>>;
+    style="rounded,filled";
+    fillcolor="#eaffea";
+    color="#0a0";
+    fontsize=12;
+
+    post_mcp [
+      shape=box, style="filled,rounded", fillcolor="#fff",
+      label="MCP subprocess\n(stdio + SSE + REST)"
+    ];
+    post_a2a_db [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>src/mcp/a2a-db.ts (610 lines, NEW)|direct pg.Pool from each subprocess\lto tank Postgres (100.64.54.102:5432)\lFOR UPDATE SKIP LOCKED on receive/dequeue\lmark-consumed (consumed_at) — NOT delete\laudit trail preserved\l}"
+    ];
+    post_pool [
+      shape=cylinder, style="filled", fillcolor="#fff",
+      label="pg.Pool\n(direct, no shell)"
+    ];
+    post_tables [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>6 dedicated tables (src/sync/schema.ts, +73 LOC)|a2a_messages | a2a_locks\la2a_events   | a2a_agents\la2a_blackboard | a2a_tasks\lmigrations run at MCP startup\lregardless of --no-sync\l}"
+    ];
+    post_conventions [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>conventions|single-row broadcast (recipient=NULL)\lcomputed registry TTL from last_heartbeat\l(no expires_at column)\lbounded blackboard reads (default 20, max 500)\lfailure mode: fail('A2A unavailable: ...')\linstead of silent empty reads\l}"
+    ];
+
+    post_mcp -> post_a2a_db [color="#222", label="calls"];
+    post_a2a_db -> post_pool [color="#222"];
+    post_pool -> post_tables [color="#222", label="INSERT/SELECT\nFOR UPDATE SKIP LOCKED"];
+    post_a2a_db -> post_conventions [color="#222", style=dotted];
+  }
+
+  // ----- Coalition-found regressions (also fixed in c7b4dba + 426edfc) -----
+  subgraph cluster_a2a_regressions {
+    label=<<b>Coalition-review regressions (fixed in c7b4dba / 426edfc)</b>>;
+    style="rounded,filled";
+    fillcolor="#eaffea";
+    color="#0a0";
+    fontsize=11;
+
+    reg_slice_recv [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>BLOCKER — receive .slice(0, 120) AFTER consume|silently dropped messages 121+\lafter marking consumed_at\lFIXED\l}"
+    ];
+    reg_slice_deq [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>BLOCKER — dequeue .slice(0, 1000) AFTER consume|same shape as receive\lFIXED\l}"
+    ];
+    reg_register [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>BLOCKER — agent_registry register|used getDbNode() (returns 'tank')\linstead of getLocalNodeId()\lall agents registered as tank\lFIXED\l}"
+    ];
+    reg_descriptions [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>MAJOR — tool descriptions|still claimed /tmp semantics\lpost-rewrite\lFIXED\l}"
+    ];
+
+    reg_slice_recv  -> post_a2a_db [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    reg_slice_deq   -> post_a2a_db [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    reg_register    -> post_a2a_db [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+    reg_descriptions-> post_mcp    [color="#0a0", label="fixed by", fontcolor="#0a0", constraint=false];
+  }
+
+  // ========================================================================
+  // CROSS-CLUSTER LINKS — timeline anchors → bug clusters
+  // ========================================================================
+  t_2026_04_10 -> a_node_x_write [color="#888", style=dotted, label="probable\ninitial trigger\n(EACCES /Users)", fontcolor="#888", constraint=false, lhead=cluster_bug_a_fanout];
+  t_2026_04_17 -> b_apr17        [color="#888", style=dotted, constraint=false, lhead=cluster_bug_b_orphan];
+  t_2026_04_18 -> b_apr18        [color="#888", style=dotted, constraint=false];
+  t_2026_04_24 -> fix_a_wave1    [color="#888", style=dotted, constraint=false, lhead=cluster_bug_a_fixes];
+  t_2026_04_24 -> fix_b_flock    [color="#888", style=dotted, constraint=false, lhead=cluster_bug_b_fixes];
+  t_2026_05_04 -> post_a2a_db    [color="#888", style=dotted, constraint=false, lhead=cluster_a2a_rewrite];
+
+  // A2A pre→post replacement edge
+  pre_void -> post_a2a_db [color="#0a0", label="replaced by", fontcolor="#0a0", constraint=false, ltail=cluster_a2a_prefix, lhead=cluster_a2a_rewrite];
+
+  // ========================================================================
+  // STATUS PANEL — fix deployment matrix
+  // ========================================================================
+  subgraph cluster_status {
+    label=<<b>fix deployment status (mesh = FROZEN)</b>>;
+    style="rounded,filled";
+    fillcolor="#f5f5f5";
+    color="#666";
+    fontsize=11;
+
+    status_panel [
+      shape=record, style="filled,rounded", fillcolor="#fff",
+      label="{<h>deployment status|\
+{ LIVE on master | openclaw.json removed from manifest\lcb('blackboard',...) removed at server.ts:3788 } |\
+{ LIVE on gang/a2a-fix-merged | A2A Postgres rewrite (a2a-db.ts + 6 tables)\lcoalition regressions fixed (c7b4dba / 426edfc) } |\
+{ BUILT NOT DEPLOYED | Wave 1 loop-breaker (mutated flag)\lflock singleton (sync + mcp-sse)\lmarker arg --omniwire-daemon=*\lStartLimitBurst=5 / IntervalSec=60\l(macbook clone built; wsl + rei still OLD code) } |\
+{ DEFERRED | Wave 2 — boundary canonicalize-on-push\lWave 3 — atomic posix-rename writes\lempty-JSON quarantine\lpath adaptation asymmetry (Bug C) } |\
+{ MESH STATE | macbook: STOPPED (launchd unloaded)\lwsl: STOPPED (systemd stopped, OLD code)\lrei: STOPPED (systemd stopped, orphans killed, OLD code)\lwindows: NEVER RUNNING (Ready)\ltank: storage only }\
+}"
+    ];
+  }
+}
